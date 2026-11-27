@@ -48,3 +48,33 @@ def test_movie_layer_controls_apply_to_both_vehicles_and_radar_age(tmp_path,monk
             pixels=np.asarray(ax.images[0].get_array())
             assert pixels[1,0,3]==0 and pixels[0,1,3]>0
     finally:close(figure)
+
+
+@pytest.mark.parametrize('metadata,expected', [
+    ({'control_mode':'forecast_constraint'}, 'BEHAVIOR CLONING NETWORK + EXPLICIT PHYSICAL CONSTRAINTS'),
+    ({}, 'POLICY'),
+    ({'behavior':'dagger_training','mixture_beta':.5}, 'POLICY'),
+])
+def test_movie_subtitle_discloses_constraint_mode_without_relabeling_pure_or_dagger(tmp_path,monkeypatch,metadata,expected):
+    import rendering
+    from matplotlib.figure import Figure
+    frame={'t':0.,'uav':{'x':11000.,'y':10000.,'vx':61.,'vy':0.,'heading':0.},
+           'ship':{'x':11000.,'y':12000.,'vx':6.,'vy':0.},'radar':{'range':3000.,'half_angle':.5}}
+    record={'task':'coverage','actor':'policy','seed':7,'summary':{},'metadata':metadata,
+            'frames':[frame,{**frame,'t':1.}],
+            'scene':{'world_bounds':[0,0,300000,300000],'roi':[10000,10000,20000,20000]}}
+    class Writer:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def append_data(self,*args):pass
+    captured=[];close=rendering.plt.close
+    monkeypatch.setattr(rendering.imageio,'get_writer',lambda *a,**k:Writer())
+    monkeypatch.setattr(Figure,'savefig',lambda self,*a,**k:captured.append(self))
+    monkeypatch.setattr(rendering.plt,'close',lambda *a:None)
+    rendering.export_video(record,tmp_path/'label.mp4',max_frames=2,width=640,height=480,
+                           visual_config={'visual_show_grid':False})
+    figure=captured[0]
+    try:
+        assert figure.texts[1].get_text()==f'{expected}  /  SEED 7  /  CONSTANT-SPEED PHYSICS'
+        assert record['actor']=='policy'
+    finally:close(figure)

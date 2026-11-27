@@ -88,6 +88,8 @@ def write_replay_index(path,record):
     entry={'task':record['task'],'actor':record['actor'],'seed':record.get('seed'),
            'frames':len(frames),'duration':frames[-1]['t'] if frames else 0,
            'behavior':record.get('metadata',{}).get('behavior')}
+    if record.get('metadata',{}).get('control_mode'):
+        entry['control_mode']=record['metadata']['control_mode']
     write_json(path.with_suffix('.replay-index.json'),
         {'schema_version':'maritime-replay-index-v1','fingerprint':[stat.st_mtime_ns,stat.st_size],'entry':entry})
 
@@ -107,6 +109,9 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     """
     if render_every < 1 or progress_every < 1 or realtime_factor < 0 or not 0<=mixture_beta<=1:
         raise ValueError('Invalid rendering cadence or playback speed')
+    constrained=bool(getattr(actor,'execution_metadata',None))
+    if constrained and (actor_name!='policy' or expert_labeler is not None):
+        raise ValueError('An explicit policy constraint layer cannot enter expert or DAgger collection')
     path = Path(output_dir) / f'{name}.json'
     if record_observations:
         path.with_suffix('.npz').unlink(missing_ok=True)
@@ -127,11 +132,15 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     behavior_metadata = ({'behavior': 'dagger_training', 'label_source': 'expert',
                           'mixture_beta': mixture_beta, 'mixture_seed': mixture_seed}
                          if expert_labeler is not None else {})
+    if constrained:
+        constraints=json_value(actor.execution_metadata)
+        behavior_metadata.update(control_mode=constraints['mode'],policy_constraints=constraints)
     if server:
         server.publish({'type': 'scene', 'scene': scene_spec, 'task': task, 'actor': actor_name,
                         'metadata': behavior_metadata})
     frames, actions, executed = [json_value(env.render())], [], []
     expert_actions=[];policy_actions=[];expert_controls=0
+    raw_policy_actions=[];constraint_interventions=[]
     sequences = {k: [np.array(v, copy=True)] for k, v in obs.items()} if record_observations else {}
     terminated = truncated = False
     start = time.perf_counter()
@@ -154,12 +163,20 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
         except Exception as error:
             planning_failure = {'type':type(error).__name__,'message':str(error),
                                 'step':step_index,'t':frames[-1]['t']}
+            if constrained and getattr(actor,'last_raw_action',None) is not None:
+                planning_failure['raw_policy_action']=json_value(actor.last_raw_action)
             terminated = True
             if type(error).__name__ not in {'ExpertPlanningError','PlanningError','NoFeasibleAction'}:
                 unexpected_error = error
             break
         if action.shape != action_shape or not np.isfinite(action).all():
             raise ValueError(f'{actor_name} returned an invalid action at step {step_index}')
+        if constrained:
+            raw_action=np.asarray(actor.last_raw_action,dtype=np.float32)
+            if raw_action.shape!=action_shape or not np.isfinite(raw_action).all():
+                raise ValueError('Policy constraint layer did not retain a valid raw action')
+            raw_policy_actions.append(raw_action.tolist())
+            constraint_interventions.append(bool(actor.last_intervened))
         obs, _, terminated, truncated, info = env.step(action)
         frame = json_value(env.render())
         frames.append(frame)
@@ -192,7 +209,7 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
         summary['termination_reason']='collection_step_limit'
     if planning_failure:
         summary['planning_failure'] = planning_failure
-        summary['termination_reason'] = 'expert_planning_failure'
+        summary['termination_reason'] = 'policy_constraint_failure' if constrained else 'expert_planning_failure'
     behavior_failed=bool(terminated or (task=='tracking' and summary.get('first_loss_time') is not None))
     label_valid=step_index>0 and len(expert_actions)==len(actions)==step_index
     expert_valid=(label_valid and unexpected_error is None if expert_labeler is not None
@@ -208,10 +225,17 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
                         action_schema='action-field-v2')
     if getattr(actor,'checkpoint_metadata',None):
         metadata['policy_checkpoint']=json_value(actor.checkpoint_metadata)
+    if constrained:
+        metadata.update(control_mode=actor.execution_metadata['mode'],
+                        policy_constraints=json_value(actor.execution_metadata))
+        summary['policy_constraints']=metadata['policy_constraints']
     record = {'schema_version': REPLAY_SCHEMA, 'task': task, 'actor': actor_name,
               'seed': int(seed), 'scene': scene_spec, 'metadata': metadata,
               'frames': frames, 'actions': actions, 'executed_actions': executed,
               'summary': summary}
+    if constrained:
+        record.update(raw_policy_actions=raw_policy_actions,
+                      constraint_interventions=constraint_interventions)
     if expert_labeler is not None:
         record['expert_actions']=expert_actions;record['policy_actions']=policy_actions
         metadata.update(behavior_metadata)

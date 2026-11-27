@@ -131,6 +131,79 @@ def test_live_dagger_scene_identifies_training_mixture(tmp_path):
     assert deployment.events[0].get('metadata', {}).get('behavior') != 'dagger_training'
 
 
+def test_constraint_rollout_keeps_raw_admitted_and_actual_commands_distinct(tmp_path):
+    module = importlib.import_module('rollouts')
+    from dataclasses import dataclass
+
+    @dataclass
+    class Configuration:
+        potential_enabled: bool = True
+        coverage_pan_limit: float = 1.
+
+    class Actor:
+        def __init__(self): self.count = 0
+        def reset(self): self.count = 0
+        @property
+        def execution_metadata(self):
+            return {'mode': 'forecast_constraint', 'checked_actions': self.count,
+                    'interventions': self.count, 'heuristic_constraint': True,
+                    'task_expert_fallback': False}
+        def act(self, obs):
+            self.count += 1
+            self.last_raw_action = np.array([1., 0., .2], np.float32)
+            self.last_intervened = True
+            return np.array([0., 1., .2], np.float32)
+
+    class Env:
+        task = 'coverage'
+        config = Configuration()
+        scene = {'world_bounds': [0, 0, 300000, 300000], 'roi': None,
+                 'clouds': [], 'islands': [], 'ship_route': []}
+        def reset(self, **kwargs): self.t = 0; return {'vector': np.zeros(111, np.float32)}, {}
+        def step(self, action):
+            np.testing.assert_array_equal(action, [0., 1., np.float32(.2)])
+            self.t += 1
+            return {'vector': np.zeros(111, np.float32)}, 0., False, True, {}
+        def render(self):
+            return {'t': self.t, 'uav': {'vx': .6, 'vy': .8}, 'radar': {'pan': .1}}
+        def summary(self): return {'time_seconds': self.t}
+
+    class Server:
+        def __init__(self): self.events = []
+        def publish(self, payload): self.events.append(payload)
+
+    server = Server()
+    record, path = module.run_episode(Env(), Actor(), seed=1, actor_name='policy',
+        output_dir=tmp_path, name='constraints', server=server)
+    assert record['metadata']['control_mode'] == 'forecast_constraint'
+    assert record['metadata']['policy_constraints']['interventions'] == 1
+    assert record['summary']['policy_constraints'] == record['metadata']['policy_constraints']
+    np.testing.assert_array_equal(record['raw_policy_actions'], [[1., 0., np.float32(.2)]])
+    np.testing.assert_array_equal(record['actions'], [[0., 1., np.float32(.2)]])
+    np.testing.assert_allclose(record['executed_actions'], [[.6, .8, .1]])
+    assert record['constraint_interventions'] == [True]
+    assert record['metadata']['expert_valid'] is False
+    assert not path.with_suffix('.npz').exists()
+    scene = server.events[0]
+    assert scene['metadata']['control_mode'] == 'forecast_constraint'
+    assert scene['metadata']['policy_constraints']['interventions'] == 0  # immutable initial snapshot
+    saved = json.loads(path.read_text(encoding='utf-8'))
+    assert saved['raw_policy_actions'] == record['raw_policy_actions']
+    index = json.loads(path.with_suffix('.replay-index.json').read_text(encoding='utf-8'))
+    assert index['entry']['control_mode'] == 'forecast_constraint'
+
+
+def test_constraint_layer_cannot_silently_enter_dagger_or_expert_collection(tmp_path):
+    module = importlib.import_module('rollouts')
+    class Actor:
+        execution_metadata = {'mode': 'forecast_constraint'}
+    class Env:
+        def reset(self, **kwargs): pytest.fail('reject ambiguous behavior before reset')
+    for kwargs in ({'actor_name': 'expert'}, {'actor_name': 'policy', 'expert_labeler': Actor()}):
+        with pytest.raises(ValueError, match='constraint'):
+            module.run_episode(Env(), Actor(), seed=1, output_dir=tmp_path, name='bad', **kwargs)
+
+
 @pytest.mark.parametrize('failure,dagger,accepted', [
     ('collision', True, True),
     ('tracking_loss', True, True),

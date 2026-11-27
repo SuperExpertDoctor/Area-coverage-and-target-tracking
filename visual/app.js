@@ -4,7 +4,8 @@ import {validateReplay, frameAtTime, formatTime} from './replay.js';
 const $ = id => document.getElementById(id);
 const map = new MaritimeMap($('map'));
 const state = {task:'coverage',actor:'expert',mode:'history',records:[],localReplays:new Map(),replay:null,index:0,playing:false,time:0,speed:60,live:new Map(),liveKey:null,loadToken:0,connected:false,catalogLoading:false};
-const actorName = actor => actor === 'expert' ? '专家策略' : '行为克隆网络';
+const actorName = (actor, metadata) => actor === 'expert' ? '专家策略' : metadata?.control_mode === 'forecast_constraint' ? '行为克隆网络 + 显式物理约束' : '行为克隆网络';
+const localReplayRecord = (url, replay, name) => ({url,name:`本地导入 / ${name}`,task:replay.task,actor:replay.actor,frames:replay.frames.length,duration:replay.frames.at(-1)?.t||0,behavior:replay.metadata?.behavior,control_mode:replay.metadata?.control_mode});
 const taskName = task => task === 'coverage' ? '区域覆盖' : '协同跟踪';
 const numeric = (value, digits=0) => Number.isFinite(value) ? value.toFixed(digits) : '—';
 const radians = value => Number.isFinite(value) ? value*180/Math.PI : NaN;
@@ -82,7 +83,7 @@ function activateReplay(replay, name='实时仿真') {
   if(replay){
     const training=replay.metadata?.behavior==='dagger_training'?` · DAgger训练混合控制 β=${replay.metadata.mixture_beta}`:'';
     const failure=replay.summary?.terminated?` · 失败终止：${replay.summary.termination_reason||'planning_failure'}`:'';
-    status(`${state.mode==='live'?'实时':'回放'} · ${taskName(state.task)} / ${actorName(state.actor)} · ${name}${training}${failure}`);
+    status(`${state.mode==='live'?'实时':'回放'} · ${taskName(state.task)} / ${actorName(state.actor,replay.metadata)} · ${name}${training}${failure}`);
   }
   scheduleRender();updateChoices();
 }
@@ -93,7 +94,8 @@ function renderCatalog() {
   if(!records.length){const option=document.createElement('option');option.value='';option.textContent='暂无该任务与策略的回放记录';$('replay-select').append(option);return records;}
   for(const record of records){
     const option=document.createElement('option');option.value=record.url;
-    option.textContent=`${record.name}${record.behavior==='dagger_training'?' [DAgger训练混合]':''} · ${formatTime(record.duration)} · ${record.frames} 帧`;
+    const constrained=record.actor!=='expert'&&record.control_mode==='forecast_constraint'?` [${actorName(record.actor,record)}]`:'';
+    option.textContent=`${record.name}${constrained}${record.behavior==='dagger_training'?' [DAgger训练混合]':''} · ${formatTime(record.duration)} · ${record.frames} 帧`;
     option.title=record.name;$('replay-select').append(option);
   }
   if(records.some(r=>r.url===selected))$('replay-select').value=selected;
@@ -107,7 +109,7 @@ async function refreshCatalog(autoLoad=false) {
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const data=await response.json();
     const remote=Array.isArray(data)?data:data.replays||[];
-    state.records=[...Array.from(state.localReplays,([url,entry])=>({url,name:`本地导入 / ${entry.name}`,task:entry.replay.task,actor:entry.replay.actor,frames:entry.replay.frames.length,duration:entry.replay.frames.at(-1)?.t||0})),...remote];
+    state.records=[...Array.from(state.localReplays,([url,entry])=>localReplayRecord(url,entry.replay,entry.name)),...remote];
     const records=renderCatalog();
     if(autoLoad&&state.mode==='history'&&!state.replay){
       if(records.length)await loadReplay($('replay-select').value);
@@ -255,7 +257,7 @@ $('replay-file').addEventListener('change',async event=>{
   try {
     const replay=validateReplay(JSON.parse(await file.text()));++state.loadToken;state.mode='history';state.task=replay.task;state.actor=replay.actor;
     const url=`local:${Date.now()}:${file.name}`;state.localReplays.set(url,{replay,name:file.name});
-    state.records.unshift({url,name:`本地导入 / ${file.name}`,task:replay.task,actor:replay.actor,frames:replay.frames.length,duration:replay.frames.at(-1)?.t||0});
+    state.records.unshift(localReplayRecord(url,replay,file.name));
     renderCatalog();$('replay-select').value=url;activateReplay(replay,file.name);
   }
   catch(error){status(`导入失败：${error.message}`);}

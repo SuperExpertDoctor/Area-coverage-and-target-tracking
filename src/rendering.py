@@ -14,6 +14,12 @@ from matplotlib.collections import LineCollection, PolyCollection
 import numpy as np
 
 
+def _control_label(record):
+    if record['actor'] in ('policy','network') and record.get('metadata',{}).get('control_mode') == 'forecast_constraint':
+        return 'BEHAVIOR CLONING NETWORK + EXPLICIT PHYSICAL CONSTRAINTS'
+    return record['actor'].upper()
+
+
 def potential_rgba(values,valid):
     """Fixed -2/-1/+1 scale, shared with the browser's potentialColor."""
     v=np.asarray(values,dtype=float);p=np.clip(v,-1,1);f=(p+1)/2
@@ -67,7 +73,7 @@ def export_video(record, output, *, fps=24, max_frames=480, width=1440, height=9
     stats.axis('off')
     title = 'PERSISTENT SEA COVERAGE' if task == 'coverage' else 'MOVING VESSEL TRACKING'
     fig.text(.055, .95, title, fontsize=21, weight='bold')
-    fig.text(.055, .913, f'{record["actor"].upper()}  /  SEED {record["seed"]}  /  CONSTANT-SPEED PHYSICS', color=muted)
+    fig.text(.055, .913, f'{_control_label(record)}  /  SEED {record["seed"]}  /  CONSTANT-SPEED PHYSICS', color=muted)
     duration=frames[-1]['t']-frames[0]['t']
     playback_factor=duration/max(1e-9,(len(indices)-1)/fps)
     fig.text(.055,.012,f'Actual simulation timestamps  |  Playback {playback_factor:.0f}x  |  Display decimated to {len(indices)} frames',color=muted,fontsize=8)

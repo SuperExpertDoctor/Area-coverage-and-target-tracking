@@ -196,6 +196,7 @@ class VisualServer:
         entry={'task':replay.get('task','coverage'),'actor':replay.get('actor','expert'),
                'seed':replay.get('seed'),'frames':len(frames),
                'duration':frames[-1].get('t',0) if frames else 0,'behavior':metadata.get('behavior')}
+        if 'control_mode' in metadata:entry['control_mode']=metadata['control_mode']
         if (file.stat().st_mtime_ns,file.stat().st_size)!=(stat.st_mtime_ns,stat.st_size):return None
         index=file.with_suffix('.replay-index.json');temporary=index.with_suffix(index.suffix+'.tmp')
         if index.resolve().is_relative_to(self.output_dir) and temporary.resolve().is_relative_to(self.output_dir):

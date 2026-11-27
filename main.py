@@ -88,6 +88,8 @@ def parser():
     p.add_argument('--dagger-recovery-min-steps',type=int,default=0,
                    help='Minimum training action exposures per accepted DAgger prefix; 0 disables repeats')
     p.add_argument('--checkpoint-path',type=Path,default=None)
+    p.add_argument('--policy-safety-layer', choices=['none', 'forecast'], default='none',
+                   help='Explicit field evaluation only: optional physical forecast constraint layer; none preserves pure network control')
     p.add_argument('--split-reference-checkpoint',type=Path,default=None,
                    help='Fresh training: preserve historical scene splits without loading its model weights or normalization')
     p.add_argument('--warm-start',action=argparse.BooleanOptionalAction,default=False)
@@ -129,6 +131,8 @@ def main(argv=None):
     cfg = Config.from_dict(json.loads(args.config_json))
     if args.potential_field is not None:
         cfg=replace(cfg,potential_enabled=args.potential_field)
+    if args.policy_safety_layer != 'none' and (args.mode != 'evaluate' or not cfg.potential_enabled):
+        raise ValueError('The forecast constraint layer requires explicit field --mode evaluate')
     # Field datasets/checkpoints must never replace existing v1 artifacts.
     if cfg.potential_enabled and args.output_dir.resolve()==(PROJECT_ROOT/'outputs').resolve():
         args.output_dir=args.output_dir/'field-v2'
@@ -378,11 +382,17 @@ def main(argv=None):
                 evaluation_cfg=cfg
                 if scene and scene.get('config_snapshot'):
                     evaluation_cfg=Config.from_dict(scene['config_snapshot'])
+                if args.policy_safety_layer == 'forecast':
+                    if not evaluation_cfg.potential_enabled:
+                        raise ValueError('The forecast constraint layer requires a field-v2 reference scene')
+                    from src.policy_constraints import ForecastConstrainedPolicy
+                    actor=ForecastConstrainedPolicy(actor,evaluation_cfg,task)
                 record,path=rollout(evaluation_cfg,actor,'policy',seed,out/'replays',f'{task}-policy-{seed}',scene=scene)
                 if expert_record and record['metadata']['scene_id']!=expert_record['metadata']['scene_id']:
                     raise RuntimeError('Expert and policy evaluation scenes differ')
                 item['evaluation_scene_id']=record['metadata']['scene_id']
                 item['policy_checkpoint']=record['metadata'].get('policy_checkpoint')
+                item['control_mode']=record['metadata'].get('control_mode','pure_network')
                 item['policy']=record['summary'];item['policy_json']=str(path.resolve())
                 item['policy_video']=video(record,out/'videos'/f'{task}-policy.mp4')
             save_report()

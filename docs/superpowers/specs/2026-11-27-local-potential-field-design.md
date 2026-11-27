@@ -76,6 +76,14 @@ CNN 为 4→16→32→32 的三层卷积及 128 维投影，物理向量编码�
 
 完美匹配专家时E为0；比专家更稳健但物理上近似等效的方向也可能E为0，因此仍须保留原动作BC。近±π的实际错转可以获得跨最近正确分支的梯度，但在精确±90°处仍可能存在驻点；λ的相对作用也依赖物理参数。这是可证伪的训练改进，不是安全证明。掩码在几何计算前选取有效时刻，不能依靠事后乘0消除padding导致的NaN。λ=0直接走原计算路径，旧权重及跟踪验收结果不能被该实验重新解释。
 
+### 可选显式物理约束层
+
+默认 `--policy-safety-layer none` 保持上述纯网络推理。`forecast` 仅允许在 field-v2 的 `evaluate` 中显式开启，不能静默进入训练、DAgger或专家采集。它使用同一公开观测解码UAV、雷云和当前bank，按已配置的有限roll运动学预测保持当前原始速度方向的未来轨迹；预测时域与步长复用 `expert_safety_horizon` / `expert_safety_projection_dt`。云半径加安全边距、圆弧弦偏差上界及额外裕量，世界边界同样收紧；岛屿和子任务ROI不是UAV硬禁区。
+
+预测可行的网络动作逐位透传；预测冲突时才调用已有 `SafetyGuidance` 选择几何约束修正，并独立复算可行性。该组件不调用覆盖/跟踪任务专家，不生成扫描目标，不改变网络给出的雷达命令；找不到可行修正时明确终止为 `policy_constraint_failure`。这属于公开的启发式约束干预，不能算网络独自学会避障。有限预测不构成递归可行性或无限时域安全证明，也不保证覆盖完成。
+
+JSON/SSE/历史目录/影片明确标记 `forecast_constraint`。JSON分别保留 `raw_policy_actions`（网络原始）、`actions`（约束后指令）、`executed_actions`（动力学实际执行）、逐步 `constraint_interventions` 与最终干预计数。约束系统与纯模型分开验收、分开整理产物；既有纯模型失败结果和发布门槛不改变。
+
 新数据和 checkpoint 显式带 obs-field-v2、action-field-v2；旧缓存、checkpoint 不得以同维度猜测兼容。JSON 回放包含原始命令、真实执行速度、实际 pan 与局部场采样；输出到 outputs 的独立 field-v2 目录，TF 到 tf-logs。入口 run.sh 明确所有新增环境、专家、网络参数。
 
 确切版本字符串：dataset_version=`bc-dataset-field-v2`，observation_schema/obs_schema=`obs-field-v2`，action_schema=`action-field-v2`，checkpoint_version=`bc-field-v2`。动作维度为 3，Loss 为每步三个动作平方误差之和；Action MSE/MAE 为所有三个分量的逐分量均值，不能沿用除以 2 的旧指标分母。模型归一化只拟合训练集；field_context 已有物理尺度，CNN 输入固定范围。默认在模型内部屏蔽上一命令，保留共同原始观测；两个任务模型仍完全独立。

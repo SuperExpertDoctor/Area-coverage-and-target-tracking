@@ -122,3 +122,47 @@ def test_main_selects_task_specific_default_cloud_encoder(tmp_path, monkeypatch,
               + cli_args(tmp_path, monkeypatch) + ['--task', task])
     assert len(calls) == 1
     assert calls[0]['model_config']['cloud_geometry_encoder'] == expected
+
+
+def test_constraint_mode_defaults_to_pure_and_requires_explicit_field_evaluation(tmp_path, monkeypatch):
+    main = importlib.import_module('main')
+    assert main.parser().parse_args([]).policy_safety_layer == 'none'
+    for extra in (['--mode', 'collect', '--potential-field'], ['--mode', 'evaluate', '--no-potential-field']):
+        with pytest.raises(ValueError, match='constraint'):
+            main.main(['--policy-safety-layer', 'forecast'] + extra + cli_args(tmp_path, monkeypatch))
+
+
+def test_main_wraps_policy_using_restored_scene_physics(tmp_path, monkeypatch):
+    from dataclasses import replace
+    import types
+    main = importlib.import_module('main')
+    policy = importlib.import_module('src.policy_tracking')
+    rollouts = importlib.import_module('rollouts')
+    from config import Config
+    cfg = replace(Config(), potential_enabled=True, uav_speed=55.)
+    checkpoint = tmp_path / 'candidate.pt'
+    checkpoint.write_bytes(b'explicit diagnostic candidate')
+    scene = {'config_snapshot': cfg.to_dict()}
+    reference = tmp_path / 'replays' / 'tracking-expert-7101.json'
+    reference.parent.mkdir()
+    reference.write_text(json.dumps({'scene': scene, 'metadata': {'scene_id': 'same'}}), encoding='utf-8')
+    base = object()
+    calls = []
+    class Wrapper:
+        def __init__(self, base_policy, config, task):
+            assert base_policy is base
+            assert config.uav_speed == 55.
+            assert task == 'tracking'
+    monkeypatch.setattr(policy.NeuralPolicy, 'from_checkpoint', lambda *a, **kw: base)
+    monkeypatch.setitem(sys.modules, 'src.policy_constraints', types.SimpleNamespace(ForecastConstrainedPolicy=Wrapper))
+    def rollout(env, actor, **kw):
+        assert isinstance(actor, Wrapper)
+        assert env.config.uav_speed == 55.
+        calls.append(kw)
+        return {'metadata': {'scene_id': 'same', 'control_mode': 'forecast_constraint'},
+                'summary': {}, 'frames': []}, tmp_path / 'record.json'
+    monkeypatch.setattr(rollouts, 'run_episode', rollout)
+    report = main.main(['--mode', 'evaluate', '--potential-field', '--policy-safety-layer', 'forecast',
+                       '--checkpoint-path', str(checkpoint)] + cli_args(tmp_path, monkeypatch))
+    assert len(calls) == 1
+    assert report['tasks']['tracking']['control_mode'] == 'forecast_constraint'

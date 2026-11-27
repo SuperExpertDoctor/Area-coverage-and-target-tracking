@@ -210,7 +210,7 @@ exec "$PYTHON" main.py \
   --validation-fraction 0.25 --training-seed 42 \
   --hidden-size 128 --heading-residual --action-frame body --feature-frame auto --normalize-vectors --normalization-min-std 0.1 \
   --correction-weight-max 4 --correction-threshold 0.1 --field-steering-loss-weight 0 --dagger-recovery-min-steps 7200 \
-  --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
+  --policy-safety-layer none --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
   --no-coverage-mask-previous-command \
   --device auto --inference-device cpu --num-threads 1 \
   --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-initial-pan-jitter 0 --dagger-max-steps 0 --no-dagger-collect-only \

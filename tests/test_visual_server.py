@@ -144,3 +144,31 @@ def test_large_legacy_replays_are_indexed_once_without_blocking_http(visual_serv
     with urlopen(visual_server.url+'api/replays',timeout=2) as response:
         entries=json.load(response)['replays']
     assert len(entries)==2 and len(calls)==1
+
+
+@pytest.mark.parametrize('sidecar_state',['missing','expired'])
+@pytest.mark.parametrize('metadata',[
+    pytest.param({'control_mode':'forecast_constraint'},id='constrained'),
+    pytest.param({},id='pure'),
+    pytest.param({'behavior':'dagger_training','mixture_beta':.5},id='dagger'),
+])
+def test_rebuilt_replay_index_preserves_control_mode_and_existing_entry_fields(visual_server,sidecar_state,metadata):
+    path=visual_server.output_dir/'copied-policy.json'
+    replay={'task':'coverage','actor':'policy','seed':19,'scene':{},
+            'metadata':metadata,'frames':[{'t':0},{'t':60}]}
+    path.write_text(json.dumps(replay),encoding='utf-8')
+    index=path.with_suffix('.replay-index.json')
+    if sidecar_state=='expired':
+        index.write_text(json.dumps({'schema_version':'maritime-replay-index-v1',
+            'fingerprint':[0,0],'entry':{'task':'coverage','actor':'expert','frames':999}}),encoding='utf-8')
+    with urlopen(visual_server.url+'api/replays') as response:
+        item=next(row for row in json.load(response)['replays'] if row['name']=='copied-policy.json')
+    expected={'task':'coverage','actor':'policy','seed':19,'frames':2,'duration':60,
+              'behavior':metadata.get('behavior')}
+    if 'control_mode' in metadata:expected['control_mode']=metadata['control_mode']
+    rebuilt=json.loads(index.read_text(encoding='utf-8'))
+    assert rebuilt['entry']==expected
+    stat=path.stat()
+    assert rebuilt['fingerprint']==[stat.st_mtime_ns,stat.st_size]
+    assert item==dict(expected,name='copied-policy.json',url='/outputs/copied-policy.json',
+                      modified=stat.st_mtime,bytes=stat.st_size)
