@@ -76,6 +76,7 @@ class Config:
     field_turn_weight: float = .05
     field_obstacle_weight: float = 1.
     field_obstacle_influence: float = 2500.
+    field_coverage_obstacle_buffer: float = 200.
     field_tracking_repulsion_limit: float = .12
     field_pan_samples: int = 9
     field_pan_goal_weight: float = .6
@@ -188,7 +189,7 @@ class Config:
             raise ValueError('Field heading offsets must be finite angles in [-pi,pi]')
         if not self.expert_safety_heading_offsets or not all(math.isfinite(v) and abs(v)<=math.pi for v in self.expert_safety_heading_offsets):
             raise ValueError('Safety heading offsets must be finite angles in [-pi,pi]')
-        nonnegative={'cloud_min_count','cloud_max_count','island_min_count','island_max_count','uav_cloud_margin','ship_island_margin','tracking_range_guard','tracking_angle_guard','roi_outer_buffer','expert_obstacle_buffer','potential_unseen_bonus','field_tracking_repulsion_limit','field_guidance_weight','field_scan_weight','field_preference_weight','field_roi_weight','field_turn_weight','field_obstacle_weight','field_pan_goal_weight','field_pan_slew_weight'}
+        nonnegative={'cloud_min_count','cloud_max_count','island_min_count','island_max_count','uav_cloud_margin','ship_island_margin','tracking_range_guard','tracking_angle_guard','roi_outer_buffer','expert_obstacle_buffer','field_coverage_obstacle_buffer','potential_unseen_bonus','field_tracking_repulsion_limit','field_guidance_weight','field_scan_weight','field_preference_weight','field_roi_weight','field_turn_weight','field_obstacle_weight','field_pan_goal_weight','field_pan_slew_weight'}
         for field in fields(self):
             value=getattr(self,field.name)
             if isinstance(value,bool) or not isinstance(value,(int,float)) or field.name=='coverage_offset':continue

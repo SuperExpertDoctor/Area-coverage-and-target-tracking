@@ -65,7 +65,8 @@ class _FieldExpert:
 
     def _safe(self, vector, uav, desired):
         c = self.config
-        buffer = min(c.expert_obstacle_buffer, c.tracking_range_guard) if self.task == 'tracking' else c.expert_obstacle_buffer
+        limit = c.tracking_range_guard if self.task == 'tracking' else c.field_coverage_obstacle_buffer
+        buffer = min(c.expert_obstacle_buffer, limit)
         return self.safety.direction(uav, desired, decode_clouds(vector, uav), obstacle_buffer=buffer)
 
 

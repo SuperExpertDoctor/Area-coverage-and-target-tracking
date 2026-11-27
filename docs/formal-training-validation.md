@@ -10,14 +10,16 @@
 
 ## 清理范围
 
-用户要求清除旧缓存；下面保留开发测量摘要，原outputs和tf-logs中的旧模型/数据/影片将删除。Git历史保留旧验证说明，克隆仓库不包含本地产物。正式结果将在运行后追加。
+用户要求清除旧缓存；实际递归删除被环境自动执行审查拒绝，旧outputs和tf-logs已隔离到被Git忽略的`.run-archive/20261128-preformal/`，随后新建空目录运行。旧产物未物理删除，正式流程不读取隔离目录。Git历史保留旧验证说明，克隆仓库不包含本地产物。正式结果将在运行后追加。
+
+以下分模块开发记录为当时的历史快照，其中“未开始正式采集”等措辞不代表当前状态。当前阶段以`outputs/formal/formal-status.json`为准，完整正式结果以`formal-report.json`为准；开发通过率不得当成本轮1000回合最新模型的任务通过率。
 
 
 ---
 
 # Formal collection implementation and measured evidence
 
-2026-11-28; scoped Task1 implementation. Root must preserve this report or its measurements before the authorized outputs cleanup.
+2026-11-28; collection implementation development snapshot. Measurements are preserved here independently of the local cache lifecycle.
 
 ## API and behavior
 
@@ -83,7 +85,7 @@ An earlier extended check exposed two CLI failures from a concurrently edited to
 
 Final current source fingerprint: `07bc1fafcfae0bff4c2b3fbcfafe4a531d29387a7a062d23f2f882843c441e72`. Throughput/full-duration pilots preceded the last source-identity guard and cadence-input validation additions; those additions change validation only and do not change Config, expert, physics, tensors or stored replay content.
 
-Raw evidence under outputs/formal-development: collection-benchmark.log; collection-benchmark/{batch-results,parity-results}.json; collection-full-duration.log; collection-full-duration-results.json; per-task accepted-manifest.json and canonical episode/cache artifacts. Root must preserve this summary before cleanup.
+Historical raw evidence was generated under outputs/formal-development: collection-benchmark.log; collection-benchmark/{batch-results,parity-results}.json; collection-full-duration.log; collection-full-duration-results.json; per-task accepted-manifest.json and canonical episode/cache artifacts. This summary preserves those measurements; raw artifacts are local and excluded from Git.
 
 
 ---
@@ -374,3 +376,25 @@ before the authorized old-output/log cleanup.
 
 
 正式启动审计发现协议序列化缺陷：Config中的tuple经JSON持久化后变成list，导致完全相同的协议误判变化，源SHA始终一致。首批尚无已完成示教时停止，旧启动输出隔离到outputs/cache/protocol-preflight-20261128，修复为统一JSON原生表示；新增JSONroundtrip及真实持久化协议续跑入口测试。相关36项和续跑入口8项通过。随后重启实际run.sh，从0采集，未将首次启动的任何轨迹纳入正式清单。
+
+## 正式监督发现的云簇局部环路
+
+40af8ab的覆盖采集在173个已接受回合、1个未完成回合的监督快照后中止。seed12153安全运行满10800秒，但3510个海面格中仍缺6格，覆盖率0.9982905983。原动作逐步回放与180个原记录帧的状态/覆盖统计误差均为0，排除了并行采集和展示的伪影。末段6386秒反复服务同一目标，约486秒周期的轨迹返回误差最大仅1.495米；t4415之后距该目标至少3054.58米，超出3000米雷达范围。
+
+该场景存在符合原硬约束的扫描位置：目标北侧2500米、航向向东、原右侧雷达pan0可同时扫描六格；对应R=1000米整圆对所有膨胀雷云边界的最小净距665.33米。因此不能将失败归咎于不可扫描场景。过大的1300米软避障缓冲与云簇形成局部外绕环路，超时后重选同一目标又放大了滞留。
+
+单变量诊断把场覆盖软缓冲改为200米，3692.7秒即完成首扫；但在7569秒又暴露候选遗漏：原10个指令全部不通过30秒预测。独立187方向审查发现35个方向通过完全相同的5秒步长保守预测，这35个也全部通过0.1秒物理步长复核。因此仅缩小软缓冲不足以验收完整任务。
+
+最终最小修复增加`field_coverage_obstacle_buffer=200`及入口显式参数/非负有限校验；只影响场覆盖专家的软引导，硬膨胀量、转弯半径、滚转、雷达范围、预测时长和圆弧保守界不变。SafetyGuidance复用原预测计算，原候选有可行解时保持原选择；原集合全失败时才搜索当前航向和原始请求航向两参考上的`field_heading_offsets`与`expert_safety_heading_offsets`并集，每条都独立重预测。该公共补充也可救活跟踪原本的失败分支，不声称所有跟踪状态的行为完全不变。
+
+真实7569秒状态与8000秒稳定环路保存为仓库测试夹具，不依赖outputs。TDD旧实现实际报规划失败或720秒后仍缺六格；修复后快速回归全部通过，原可行黄金指令逐位一致。全量测试358 passed、1 skipped，149.59秒。
+
+修复后的生产专家使用同一原场景，从原始起点完整运行10800秒：首扫3692.7秒，最终覆盖率1、重扫率1，无机船碰撞/越界/规划异常；最小按决策步采样的云硬边界净距158.70米，额外候选启用4次。上述为该失败场景的修复证据，不是任意初始化保证。
+
+被中止的正式目录及日志已隔离到`.run-archive/20261128-expert-local-trap/`，没有送入新一轮正式训练；新建outputs/formal后内容为0项，tf-logs中也尚无训练事件。完成额外开发场景回归与独立审查后，再以修复源码从0启动1000+1000个回合，而不混合修复前后的来源。
+
+补充回归完成：覆盖7100/2000/2001/3002/4000均安全运行满10800秒、覆盖率1，重扫比例0.99447–1；跟踪2000/2001均满1800秒且全程可见。加上原12153，共6个覆盖、2个跟踪完整开发场景通过，始末源码SHA一致。这些开发种子未代替正式960000/970000系列未见测试。
+
+独立审查78项通过；64组合中原本可行的61组指令与旧实现逐位一致。真实8000秒六格快照消融：保留新预测候选但恢复软缓冲1300米，720步后仍有六格未扫；软缓冲200米则33步内补全。真实7569秒返回指令也用未量化状态/原精确云参数独立复核，30秒物理轨迹最小硬净距248.14米。审查未发现阻塞；以上有限证据不构成任意状态的安全证明。
+
+用户随后明确确认每任务1000回合（总计2000）、各800训练+200验证，另生成独立闭环测试；与已设定正式协议一致。

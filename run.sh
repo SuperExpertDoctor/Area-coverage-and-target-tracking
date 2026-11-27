@@ -56,6 +56,7 @@ SIM_CONFIG=$(cat <<'JSON'
   "field_turn_weight": 0.05,
   "field_obstacle_weight": 1.0,
   "field_obstacle_influence": 2500.0,
+  "field_coverage_obstacle_buffer": 200.0,
   "field_tracking_repulsion_limit": 0.12,
   "field_pan_samples": 9,
   "field_pan_goal_weight": 0.6,

@@ -27,7 +27,7 @@ bash run.sh formal
 自动录像优先复用已安装Chrome/Edge，也支持Playwright Chromium。没有浏览器时，可加`--no-browser-recording`运行仿真训练；自动前端录屏需要补齐浏览器。所有Python仿真、专家、训练、路径、端口及录像超参数集中于`run.sh`，经CLI传给`main.py`；末尾参数可以覆盖入口默认值。
 
 ```bash
-# 默认正式配置：每任务1000个成功回合，800训练/200验证，另做独立闭环测试
+# 默认正式配置：每任务1000个成功回合，按场景组8:2划分，另做独立闭环测试
 bash run.sh
 # 后台/自动运行：关闭自动打开浏览器和完成后常驻服务
 bash run.sh formal --no-open-browser --no-keep-server
@@ -46,7 +46,7 @@ python -m tensorboard.main --logdir tf-logs --host 127.0.0.1 --port 6006
 
 `--episodes`是**每任务成功回合数**。每回合完整观测、专家标签和实际动作均保留；稀疏展示帧不降低物理积分或训练采样频率。无法初始化、规划失败、物理失败和任务未完成分别保留，只有成功清单中的NPZ进入训练。正式流程不使用旧数据或warm start；同源代码/配置/预算/种子协议可续跑，协议不一致必须使用新输出目录。
 
-200个每轮用于计算损失的回合称为验证集，独立测试场景不参与归一化、训练或权重选择。最终影片**仅加载本轮最后一轮`last.pt`**，按SHA256冻结，不回退`best.pt`或专家动作。覆盖影片默认公开启用`forecast`物理约束，跟踪使用纯网络；覆盖纯网络结果同时保留。可通过`--formal-coverage-safety-layer none`明确改为纯网络验收。
+数据按`scene_group_id`作8:2分组；1000个独立场景组对应800训练/200验证回合，实际划分写入`dataset_split.json`。每轮用于计算损失的子集称为验证集，独立测试场景不参与归一化、训练或权重选择。最终影片**仅加载本轮最后一轮`last.pt`**，按SHA256冻结，不回退`best.pt`或专家动作。覆盖影片默认公开启用`forecast`物理约束，跟踪使用纯网络；覆盖纯网络结果同时保留。可通过`--formal-coverage-safety-layer none`明确改为纯网络验收。
 
 ## 数学模型
 
@@ -77,7 +77,13 @@ $$
 
 $V_s=12$节；舵角、舵速和转弯半径均有限制。A*输出航路，路径跟随器输出期望航向，再由上述模型积分。决策步长1秒、物理检查0.1秒，内部RK4最大步长0.05秒。速度参考彩虹系列和科考船公开资料；转弯/舵机系数为明确列出的仿真参数，未声称完成真实机船辨识。详见[运动学说明](docs/kinematics.md)。
 
-雷达实际偏角也受转速约束：$\dot\alpha=\operatorname{clip}((\alpha_c-\alpha)/\Delta t,-\omega_{radar},\omega_{radar})$。点$q$命中的条件为$\|q-p_a\|\le3000$且$|\operatorname{wrap}(\operatorname{atan2}(q_y-y_a,q_x-x_a)-\psi-\beta-\alpha)|\le\pi/6$。覆盖安装角$\beta=-\pi/2$、偏角限幅±60°；跟踪$\beta=0$、限幅±120°，最大偏转速度30°/s。按实际扇形与物理子步判定命中。
+雷达指令$\alpha_c$先按任务机械偏角限幅，每个物理子步$h=0.1$s执行转速限制：
+
+$$
+\alpha_{n+1}=\alpha_n+\operatorname{clip}(\alpha_c-\alpha_n,-\omega_{radar}h,+\omega_{radar}h).
+$$
+
+点$q$命中的条件为$\|q-p_a\|\le3000$且$|\operatorname{wrap}(\operatorname{atan2}(q_y-y_a,q_x-x_a)-\psi-\beta-\alpha)|\le\pi/6$。覆盖安装角$\beta=-\pi/2$、偏角限幅±60°；跟踪$\beta=0$、限幅±120°，最大偏转速度30°/s。按实际扇形与物理子步判定命中。
 
 ### 局部引力–斥力场
 
@@ -100,7 +106,7 @@ J_c=w_g\,d\cdot d_{goal}+w_s U_{sector}+w_p F_{path}
 -w_b C_{outside}-w_o C_{hard}-w_t|\operatorname{wrap}(\psi_c-\psi)|.
 $$
 
-$U_{sector}$汇总实际可达扇形内的场值，并含目标对准收益、雷达转动惩罚；候选预测遵守最大转率，选中动作再进行有限滚转的精确避障预测。全局公开扫描目标依据未扫优先、年龄、距离和近期目标去重产生，避免纯局部势场长期循环；专家和网络都能从相同obs获得该目标。目标区外−1为软偏好，不能将其错误当成绝不越出的硬墙：固定翼转弯可以短暂使用区外缓冲。
+$U_{sector}$汇总实际可达扇形内的场值，并含目标对准收益、雷达转动惩罚；$F_{path}$为预测采样点$\min(F,0)$的均值，$C_{outside}$为到ROI的归一化距离。候选预测遵守最大转率，选中动作再进行有限滚转的精确避障预测。全局公开扫描目标依据未扫优先、年龄和距离产生，扫描完成或超时后重新评选；有实质接近时延长服务期限。专家和网络都能从相同obs获得该目标。该机制不能证明完全消除局部环路。目标区外−1为软偏好，固定翼转弯可以短暂使用区外缓冲。
 
 跟踪专家在移动目标参考系中维持期望绕飞半径$r_d=2000$m。设$e=(p_a-p_s)/\|p_a-p_s\|$，$t$为顺时针切向，
 
@@ -111,6 +117,18 @@ $$
 $$
 
 雷达偏角对准船舶并补偿相对视线角速度。运动学等式、转弯/舵机/雷达速率、雷云和边界为约束；距离/视场为跟踪目标和失败判据。实现对滚转延迟作预测补偿，近障碍使用受限斥力和几何避让。有限候选启发式不是求得全局最优的非线性规划器。
+
+设全域为$\mathcal W$，雷云中心/半径为$(c_j,r_j)$，岛屿为$(i_k,\rho_k)$，实体安全膨胀量为$m_a,m_s$。飞行与航行硬约束分别为：
+
+$$
+p_a(t),p_s(t)\in\mathcal W,\qquad
+\|p_a(t)-c_j\|\ge r_j+m_a,\qquad
+\|p_s(t)-i_k\|\ge\rho_k+m_s.
+$$
+
+岛屿不约束UAV，雷云不约束船舶；覆盖ROI边界不等同全域硬边界。避障的提前引导软缓冲与上述硬膨胀量是两个参数，缩小软缓冲不能放宽硬约束。实际实现逐物理子步检查轨迹段，并在前向预测中额外考虑圆弧与弦的偏差。
+
+场覆盖专家的软缓冲由`field_coverage_obstacle_buffer=200`米单独配置，上限仍为`expert_obstacle_buffer`，以免提前绕飞距离超出3 km扫描包络；跟踪仍使用其自身距离预留。通用安全引导原候选全部失败时，才补查当前航向及原请求航向附近的显式配置候选，每条均执行相同物理预测。真实云簇回归见[实施记录](docs/formal-training-validation.md)。
 
 显式`forecast`层独立预测网络动作未来30秒的物理轨迹：安全时原样透传，冲突时公开记录几何修正，再检查修正轨迹。它不调用覆盖/跟踪任务专家；通用修正不可行时，额外搜索配置中的转向候选及上一条安全指令，每条都从当前状态重新进行物理预测；记录`constraint_version`及`candidate_repairs`。原始网络动作、约束后动作、实际动作及干预标志分别保存。它有有限预测视野，不构成全局安全证明。
 
@@ -125,7 +143,7 @@ $$
 | `field_context` |16|16|场半径/周期/形状、安装角/偏角限制/转速、目标等 |
 | `action` |3|3|世界XY单位期望方向 + 归一化雷达偏角 |
 
-期望速度方向设定为$V_a\,a_{0:2}$，实际速度为$V_a(\cos\psi,\sin\psi)$，雷达指令为限幅角乘$a_2$；环境仍统一执行运动学限制。默认在网络内部旋转至机体系，屏蔽上一拍命令以减少复制捷径，公共接口保持世界坐标。
+环境将非零XY指令归一化为期望速度$V_a\,a_{0:2}/\|a_{0:2}\|$，近零指令保持当前航向；实际速度为$V_a(\cos\psi,\sin\psi)$，雷达指令为限幅角乘$a_2$。环境统一执行运动学限制。默认在网络内部旋转至机体系，屏蔽上一拍命令以减少复制捷径，公共接口保持世界坐标。
 
 每个网络独立拥有：局部场CNN(4→16→32→32→128)、运动矢量MLP、场上下文MLP(16→64→64)、单层GRU128、方向和雷达残差头。覆盖默认对云集合共享编码并池化，跟踪保留固定槽位编码；方向/雷达几何参考只使用公开观测。GRU保留历史，但不能凭空恢复从未观测的信息。
 
@@ -137,9 +155,9 @@ $$
 \operatorname{MAE}=\frac{1}{3N}\sum_t\|\pi_\theta(o_{\le t})-a_t^E\|_1.
 $$
 
-可选纠正加权/执行感知损失默认关闭；启用后Loss含额外项，原始MSE/MAE仍按共同动作计算。归一化仅拟合训练集，同一`scene_group_id`不能跨训练/验证。只上报适用的6条TF曲线：`Train/Loss`、`Validation/Loss`、两子集的`Action_MSE`和`Action_MAE`。当前确定性连续策略不伪造离散准确率、NLL、KL或熵。
+可选纠正加权/执行感知损失默认关闭；前者改变Loss权重，后者增加辅助项，原始MSE/MAE始终按共同动作不加权计算。归一化仅拟合训练集，同一`scene_group_id`不能跨训练/验证。只上报适用的6条TF曲线：`Train/Loss`、`Validation/Loss`、两子集的`Action_MSE`和`Action_MAE`。当前确定性连续策略不伪造离散准确率、NLL、KL或熵。epoch0提供未更新权重的基线；之后Train累计更新过程中各chunk的误差，Validation在当轮更新完成后用固定权重计算。
 
-`best.pt`按验证MSE保存，`last.pt`保存最新完成epoch。完整epoch边界续训恢复Adam、RNG、划分、归一化和历史，批内加载有界；普通warm-start只恢复模型且重新初始化优化器，不等同续训。普通CUDA可能有浮点非确定性，严格可复现需一致环境及确定性设置。每chunk更新`training-status.json`，每epoch原子更新checkpoint和`history.json`。
+`best.pt`按验证MSE保存，候选包含epoch0；`last.pt`保存最新完成epoch。formal最终测试和影片固定使用last；分阶段训练导出的`<task>_policy.pt`采用best，普通evaluate按显式checkpoint或selected/best规则执行。完整epoch边界续训恢复Adam、RNG、划分、归一化和历史，批内加载有界；普通warm-start恢复模型及归一化缓冲区、重新初始化优化器，不等同续训。普通CUDA可能有浮点非确定性，严格可复现需一致环境及确定性设置。按配置的chunk数或时间间隔、批加载及阶段边界更新`training-status.json`（默认50chunk或30秒），每个完整epoch原子更新checkpoint和`history.json`。
 
 ## Python与HTTP接口
 
@@ -226,6 +244,6 @@ python -m pytest -q
 python -m examples.plot_kinematics --output outputs/kinematics/kinematics.png
 ```
 
-正式本轮结果以运行后生成的`outputs/formal/formal-report.json`为准，未完成前不将历史结果当成本轮验收。开发阶段启发式专家示教已实测完整10800秒覆盖2/2、1800秒跟踪2/2通过；八进程采集小批量最快；1000+1000回合存储估计约67 GB，不含失败与测试。详细性能、测试和已知边界见[正式实施记录](docs/formal-training-validation.md)。之前的纯覆盖网络失败与显式约束验证保留在[历史验证](docs/local-potential-field-validation.md)，对应本地旧缓存按本次要求清理。
+正式本轮结果以运行后生成的`outputs/formal/formal-report.json`为准，未完成前不将历史结果当成本轮验收。开发阶段启发式专家示教已实测完整10800秒覆盖2/2、1800秒跟踪2/2通过；八进程采集小批量最快；1000+1000回合存储估计约67 GB，不含失败与测试。详细性能、测试和已知边界见[正式实施记录](docs/formal-training-validation.md)。之前的纯覆盖网络失败与显式约束验证保留在[历史验证](docs/local-potential-field-validation.md)。本机旧缓存因自动执行审查拒绝递归删除，已移入被Git忽略的`.run-archive/20261128-preformal/`；正式流程在新建的空输出目录启动，不读取隔离数据。
 
 数学/初始化/文献详见[算法设计](docs/superpowers/specs/2026-11-27-maritime-imitation-design.md)、[局部场设计](docs/superpowers/specs/2026-11-27-local-potential-field-design.md)、[正式方案](docs/superpowers/specs/2026-11-28-formal-training-and-recording-design.md)。参考[Dubins](https://msl.cs.illinois.edu/~lavalle/planning/node821.html)、[EGO-Planner](https://arxiv.org/abs/2008.08835)、[持续覆盖规划](https://arxiv.org/abs/1908.09236)、[Fossen船舶模型](https://www.fossen.biz/html/marineCraftModel.html)；具体方法与论文贡献的区别在设计文档明确说明。图片及二维模型许可见[素材说明](figs/ATTRIBUTION.md)。

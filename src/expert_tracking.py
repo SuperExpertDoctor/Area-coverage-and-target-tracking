@@ -31,6 +31,23 @@ class SafetyGuidance:
 
     def reset(self):self.sides={}
 
+    def _forecast_clearance(self,uav,action,clouds):
+        """Use the same finite-roll forecast for every candidate direction."""
+        c=self.config;state=uav;clearance=math.inf
+        count=int(math.ceil(c.expert_safety_horizon/c.expert_safety_projection_dt))
+        projection_dt=c.expert_safety_horizon/count
+        for _ in range(count):
+            nxt=self.model.step_velocity(state,action,projection_dt)
+            curve_margin=c.uav_speed*self.model.config.max_yaw_rate*projection_dt**2/8+c.expert_safety_extra_margin
+            if not in_bounds((nxt.x,nxt.y),c.world_bounds,curve_margin):return None
+            for ob in clouds:
+                # Bound departure of the physical curve from each forecast chord.
+                radius=ob['radius']+c.uav_cloud_margin+curve_margin
+                if segment_circle_collision((state.x,state.y),(nxt.x,nxt.y),(ob['x'],ob['y']),radius):return None
+                clearance=min(clearance,math.hypot(nxt.x-ob['x'],nxt.y-ob['y'])-radius)
+            state=nxt
+        return clearance
+
     def direction(self,uav,desired,clouds,obstacle_buffer=None):
         c=self.config
         soft_buffer=c.expert_obstacle_buffer if obstacle_buffer is None else obstacle_buffer
@@ -39,6 +56,7 @@ class SafetyGuidance:
         direction=np.asarray(desired,dtype=float)
         norm=float(np.linalg.norm(direction))
         direction=direction/norm if norm>=1e-6 else unit(uav.heading).astype(float)
+        requested_heading=math.atan2(direction[1],direction[0])
         p=np.array([uav.x,uav.y])
         # Resolve overlapping guidance zones from far to near: a distant cloud
         # must never overwrite the avoidance direction of an imminent cloud.
@@ -85,24 +103,22 @@ class SafetyGuidance:
                 if shift is None:
                     if feasible:break
                     shift=abs(wrap(uav.heading-heading))
-                state=uav;clearance=math.inf;safe=True
-                count=int(math.ceil(c.expert_safety_horizon/c.expert_safety_projection_dt))
-                projection_dt=c.expert_safety_horizon/count
-                for _ in range(count):
-                    nxt=self.model.step_velocity(state,action,projection_dt)
-                    curve_margin=c.uav_speed*self.model.config.max_yaw_rate*projection_dt**2/8+c.expert_safety_extra_margin
-                    if not in_bounds((nxt.x,nxt.y),b,curve_margin):safe=False;break
-                    for ob in clouds:
-                        # Forecast chords can depart from curved paths. Bound that
-                        # sagitta conservatively at the maximum lateral acceleration.
-                        radius=ob['radius']+c.uav_cloud_margin+curve_margin
-                        if segment_circle_collision((state.x,state.y),(nxt.x,nxt.y),(ob['x'],ob['y']),radius):safe=False;break
-                        clearance=min(clearance,math.hypot(nxt.x-ob['x'],nxt.y-ob['y'])-radius)
-                    if not safe:break
-                    state=nxt
-                if safe:
+                clearance=self._forecast_clearance(uav,action,clouds)
+                if clearance is not None:
                     feasible.append((abs(shift)-c.expert_safety_clearance_reward*min(clearance,c.expert_safety_clearance_cap),action))
                     if shift==0:return action
+            if not feasible:
+                # A cloud deflection can hide feasible headings from the original
+                # shifted set. Search public current/requested references only
+                # after that set fails, retaining the identical hard forecast.
+                offsets=tuple(dict.fromkeys((*c.field_heading_offsets,*c.expert_safety_heading_offsets)))
+                for reference in (uav.heading,requested_heading):
+                    for offset in offsets:
+                        angle=reference+offset;action=unit(angle)
+                        clearance=self._forecast_clearance(uav,action,clouds)
+                        if clearance is not None:
+                            shift=abs(wrap(angle-heading))
+                            feasible.append((shift-c.expert_safety_clearance_reward*min(clearance,c.expert_safety_clearance_cap),action))
             if not feasible:raise ExpertPlanningError(f'No safe physical {c.expert_safety_horizon:g}-second candidate at current state')
             return min(feasible,key=lambda item:item[0])[1]
         return np.array(direction,dtype=np.float32)
