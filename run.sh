@@ -163,6 +163,7 @@ SIM_CONFIG=$(cat <<'JSON'
     1.4
   ],
   "expert_safety_clearance_reward": 5e-05,
+  "expert_safety_fallback_heading_samples": 145,
   "expert_safety_clearance_cap": 1000.0,
   "expert_safety_extra_margin": 10.0,
   "ship_planning_radius_factor": 2.0,

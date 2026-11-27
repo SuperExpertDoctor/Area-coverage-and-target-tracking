@@ -128,7 +128,7 @@ $$
 
 岛屿不约束UAV，雷云不约束船舶；覆盖ROI边界不等同全域硬边界。避障的提前引导软缓冲与上述硬膨胀量是两个参数，缩小软缓冲不能放宽硬约束。实际实现逐物理子步检查轨迹段，并在前向预测中额外考虑圆弧与弦的偏差。
 
-场覆盖专家的软缓冲由`field_coverage_obstacle_buffer=200`米单独配置，上限仍为`expert_obstacle_buffer`，以免提前绕飞距离超出3 km扫描包络；跟踪仍使用其自身距离预留。通用安全引导原候选全部失败时，才补查当前航向及原请求航向附近的显式配置候选，每条均执行相同物理预测。真实云簇回归见[实施记录](docs/formal-training-validation.md)。
+场覆盖专家的软缓冲由`field_coverage_obstacle_buffer=200`米单独配置，上限仍为`expert_obstacle_buffer`，以免提前绕飞距离超出3 km扫描包络；跟踪仍使用其自身距离预留。通用安全引导原候选全部失败时，才补查当前航向及原请求航向附近的显式配置候选；仍无解才使用`expert_safety_fallback_heading_samples=145`个全圆方向，按与通用修正方向的角差逐条执行相同物理预测。网格为$\psi_m=\psi-\pi+2\pi m/N$（$m=0,\ldots,N-1$），以当前航向为参考，保持与机体系网络输入的旋转一致性。有限离散搜索仍可能无解，失败如实保留。真实云簇回归见[实施记录](docs/formal-training-validation.md)。
 
 显式`forecast`层独立预测网络动作未来30秒的物理轨迹：安全时原样透传，冲突时公开记录几何修正，再检查修正轨迹。它不调用覆盖/跟踪任务专家；通用修正不可行时，额外搜索配置中的转向候选及上一条安全指令，每条都从当前状态重新进行物理预测；记录`constraint_version`及`candidate_repairs`。原始网络动作、约束后动作、实际动作及干预标志分别保存。它有有限预测视野，不构成全局安全证明。
 
@@ -244,6 +244,6 @@ python -m pytest -q
 python -m examples.plot_kinematics --output outputs/kinematics/kinematics.png
 ```
 
-正式本轮结果以运行后生成的`outputs/formal/formal-report.json`为准，未完成前不将历史结果当成本轮验收。开发阶段启发式专家示教已实测完整10800秒覆盖2/2、1800秒跟踪2/2通过；八进程采集小批量最快；1000+1000回合存储估计约67 GB，不含失败与测试。详细性能、测试和已知边界见[正式实施记录](docs/formal-training-validation.md)。之前的纯覆盖网络失败与显式约束验证保留在[历史验证](docs/local-potential-field-validation.md)。本机旧缓存因自动执行审查拒绝递归删除，已移入被Git忽略的`.run-archive/20261128-preformal/`；正式流程在新建的空输出目录启动，不读取隔离数据。
+正式本轮结果以运行后生成的`outputs/formal/formal-report.json`为准，未完成前不将开发结果当成本轮验收。当前修复版专家的42场景开发验证全部通过：34个覆盖场景安全完成10800秒、栅格覆盖率1（重扫比例0.9060–1），8个跟踪场景完成1800秒且全程可见；全量373项测试通过、1项跳过。1000+1000回合存储估计约67 GB，不含失败与测试。详细性能、真实失败、修复及已知边界见[正式实施记录](docs/formal-training-validation.md)。之前的纯覆盖网络失败与显式约束验证保留在[历史验证](docs/local-potential-field-validation.md)。本机旧缓存因自动执行审查拒绝递归删除，已移入被Git忽略的`.run-archive/20261128-preformal/`；正式流程在新建的空输出目录启动，不读取隔离数据。
 
 数学/初始化/文献详见[算法设计](docs/superpowers/specs/2026-11-27-maritime-imitation-design.md)、[局部场设计](docs/superpowers/specs/2026-11-27-local-potential-field-design.md)、[正式方案](docs/superpowers/specs/2026-11-28-formal-training-and-recording-design.md)。参考[Dubins](https://msl.cs.illinois.edu/~lavalle/planning/node821.html)、[EGO-Planner](https://arxiv.org/abs/2008.08835)、[持续覆盖规划](https://arxiv.org/abs/1908.09236)、[Fossen船舶模型](https://www.fossen.biz/html/marineCraftModel.html)；具体方法与论文贡献的区别在设计文档明确说明。图片及二维模型许可见[素材说明](figs/ATTRIBUTION.md)。

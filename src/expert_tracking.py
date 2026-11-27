@@ -119,7 +119,16 @@ class SafetyGuidance:
                         if clearance is not None:
                             shift=abs(wrap(angle-heading))
                             feasible.append((shift-c.expert_safety_clearance_reward*min(clearance,c.expert_safety_clearance_cap),action))
-            if not feasible:raise ExpertPlanningError(f'No safe physical {c.expert_safety_horizon:g}-second candidate at current state')
+            if not feasible:
+                # The reference offsets can straddle a narrow feasible interval.
+                # Exhaust them first, then try a bounded full-circle grid in
+                # order of deviation from the generic corrected heading.
+                angles=sorted(uav.heading+np.linspace(-math.pi,math.pi,c.expert_safety_fallback_heading_samples,endpoint=False),
+                              key=lambda angle:abs(wrap(angle-heading)))
+                for angle in angles:
+                    action=unit(angle)
+                    if self._forecast_clearance(uav,action,clouds) is not None:return action
+                raise ExpertPlanningError(f'No safe physical {c.expert_safety_horizon:g}-second candidate at current state')
             return min(feasible,key=lambda item:item[0])[1]
         return np.array(direction,dtype=np.float32)
 

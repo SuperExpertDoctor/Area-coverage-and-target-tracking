@@ -132,6 +132,7 @@ class Config:
     expert_world_buffer_turn_factor: float = 2.5
     expert_world_inward_gain: float = 3.
     expert_safety_heading_offsets: tuple = (0., -.4, .4, -.8, .8, -1.4, 1.4)
+    expert_safety_fallback_heading_samples: int = 145
     expert_safety_clearance_reward: float = .00005
     expert_safety_clearance_cap: float = 1000.
     expert_safety_extra_margin: float = 10.
@@ -209,6 +210,7 @@ class Config:
         if self.ship_route_spacing>25:raise ValueError('ship_route_spacing may not exceed25m')
         if 64 % self.coverage_planning_blocks:raise ValueError('coverage_planning_blocks must divide64')
         if self.expert_safety_projection_dt>self.expert_safety_horizon:raise ValueError('Safety projection dt exceeds horizon')
+        if self.expert_safety_fallback_heading_samples<8:raise ValueError('expert_safety_fallback_heading_samples must be at least8')
         if not 0<self.ship_bypass_corner_fraction<.5:raise ValueError('ship_bypass_corner_fraction must be below.5')
         if self.cloud_min_radius>self.cloud_max_radius or self.island_min_radius>self.island_max_radius:
             raise ValueError('Obstacle radius ranges must be ordered')
