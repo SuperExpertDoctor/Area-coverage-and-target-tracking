@@ -11,6 +11,7 @@ from geometry import in_bounds, segment_circle_collision, wrap
 from navigation import ShipNavigator
 from observations import build_observation, observation_space, observation_metadata
 from scenario import sample_coverage_scene, sample_tracking_scene, validate_scene
+from potential_field import LocalPotentialField
 
 
 class BaseMaritimeEnv(gym.Env):
@@ -24,9 +25,9 @@ class BaseMaritimeEnv(gym.Env):
         self.render_callback=render_callback
         self.uav_model=FixedWingModel(self.config.uav_config)
         self.ship_model=ShipModel(self.config.ship_config)
-        self.observation_space=observation_space(self.task)
-        self.action_space=spaces.Box(-1.,1.,(2,),dtype=np.float32)
-        self.observation_schema=observation_metadata(self.task)
+        self.observation_space=observation_space(self.task,self.config.potential_enabled)
+        self.action_space=spaces.Box(-1.,1.,(3 if self.config.potential_enabled else 2,),dtype=np.float32)
+        self.observation_schema=observation_metadata(self.task,self.config.potential_enabled)
         self._done=True
         self.scene=None
 
@@ -52,6 +53,10 @@ class BaseMaritimeEnv(gym.Env):
         self.ship_navigator=ShipNavigator(scene['ship_route'],self.config.ship_lookahead,self.config.ship_route_local_search_points)
         self.physics_tick=0
         self.radar_pan=float(scene['radar_pan_initial'])
+        self.desired_radar_pan=self.radar_pan
+        self.public_goal=None;self.public_goal_priority=0.;self._goal_selected_tick=0;self._goal_deadline=0.
+        if self.config.potential_enabled:
+            self.potential_field=LocalPotentialField(self.config,scene.get('roi'),scene['islands'],scene['clouds'],self.task=='tracking')
         self.previous_action=np.array([math.cos(self.uav.heading),math.sin(self.uav.heading)],dtype=np.float32)
         self.termination_reason=None
         self.uav_collision=False;self.ship_collision=False;self.out_of_bounds=False
@@ -68,17 +73,79 @@ class BaseMaritimeEnv(gym.Env):
 
     def _update_task(self,initial=False):pass
 
+    def _update_public_goal(self):
+        if self.task=='tracking':
+            self.public_goal=np.array([self.ship.x,self.ship.y],dtype=float)
+            self.public_goal_priority=1.
+            return
+        c=self.config
+        if self.public_goal is not None:
+            distance_to_goal=math.hypot(self.uav.x-self.public_goal[0],self.uav.y-self.public_goal[1])
+            progress_bucket=int(math.ceil(distance_to_goal/self.potential_field.spacing))
+            if progress_bucket<self._goal_progress_bucket:
+                # Detours consume more time than the original straight-line ETA.
+                # Extend only on a newly closer cell, not microscopic improvements
+                # on a limiting orbit; the nonnegative bucket can fall finitely.
+                self._goal_progress_bucket=progress_bucket
+                self._goal_deadline=max(self._goal_deadline,self.t+distance_to_goal/c.uav_speed+c.potential_goal_hold_seconds)
+            near=((self.grid_x-self.public_goal[0])**2+(self.grid_y-self.public_goal[1])**2<=c.potential_goal_radius**2)&self.sea_mask
+            scanned=bool(np.any(near) and np.all(self.last_seen_tick[near]>self._goal_selected_tick))
+            expired=self.t>=self._goal_deadline
+            if not scanned and not expired:return
+        # The 64x64 map is evaluation timestamp memory, never a cached global field.
+        unseen=self.last_seen_tick<0
+        age=np.where(unseen,c.potential_period,(self.physics_tick-self.last_seen_tick)*c.physics_dt)
+        priority=np.minimum(age/c.potential_period,1.)+c.potential_unseen_bonus*unseen
+        distance=np.hypot(self.grid_x-self.uav.x,self.grid_y-self.uav.y)
+        extent=max(self.scene['roi'][2]-self.scene['roi'][0],self.scene['roi'][3]-self.scene['roi'][1])
+        # Local attraction saturates at T, but service selection must retain the
+        # timestamp distinction between old cells. First finish unseen sea;
+        # thereafter use uncapped age for fairness, keeping public priority [0,1].
+        if np.any(unseen&self.sea_mask):
+            score=np.where(unseen&self.sea_mask,1.+distance/extent,-np.inf)
+        else:
+            score=np.where(self.sea_mask,age/c.potential_period*(1.+distance/extent),-np.inf)
+        if not np.any(self.sea_mask):self.public_goal=None;self.public_goal_priority=0.;return
+        index=np.unravel_index(np.argmax(score),score.shape)
+        self.public_goal=np.array([self.grid_x[index],self.grid_y[index]],dtype=float)
+        self.public_goal_priority=float(priority[index])/(1.+c.potential_unseen_bonus);self._goal_selected_tick=self.physics_tick
+        self._goal_deadline=self.t+float(distance[index])/c.uav_speed+c.potential_goal_hold_seconds
+        self._goal_progress_bucket=int(math.ceil(float(distance[index])/self.potential_field.spacing))
+
+    def potential_snapshot(self):
+        if not self.config.potential_enabled:raise RuntimeError('potential field requires potential_enabled=True')
+        self._update_public_goal()
+        return self.potential_field.snapshot((self.uav.x,self.uav.y),self.t,self.public_goal)
+
+    def field_context(self,potential=None):
+        c=self.config
+        if potential is None:potential=self.potential_snapshot()
+        goal=self.public_goal
+        offset=c.coverage_offset if self.task=='coverage' else 0.
+        limit=c.coverage_pan_limit if self.task=='coverage' else c.pan_limit
+        water=potential[1].astype(bool)&~potential[2].astype(bool)
+        preference=float(np.mean(potential[0][water])) if np.any(water) else 0.
+        nearest=min((math.hypot(o['x']-self.uav.x,o['y']-self.uav.y)-o['radius'] for o in self.scene['clouds']),default=math.hypot(c.world_bounds[2]-c.world_bounds[0],c.world_bounds[3]-c.world_bounds[1]))
+        coverage=self.coverage_ratio if self.task=='coverage' else 0.
+        unseen=1.-coverage if self.task=='coverage' else 0.
+        return np.array([c.potential_radius/3000,c.potential_period/3600,c.potential_decay,self.radar_pan/math.pi,
+            offset/math.pi,limit/math.pi,c.max_pan_rate,0. if goal is None else (goal[0]-self.uav.x)/3000,
+            0. if goal is None else (goal[1]-self.uav.y)/3000,self.public_goal_priority,float(goal is not None),
+            unseen,preference,nearest/3000,coverage,float(self.task=='tracking')],dtype=np.float32)
+
     def _update_radar(self,dt):
         dx,dy=self.ship.x-self.uav.x,self.ship.y-self.uav.y
         self.distance=math.hypot(dx,dy)
         bearing=math.atan2(dy,dx)
+        if self.config.potential_enabled:
+            self.radar_pan+=max(-self.config.max_pan_rate*dt,min(self.config.max_pan_rate*dt,self.desired_radar_pan-self.radar_pan))
         if self.task=='tracking':
             desired=max(-self.config.pan_limit,min(self.config.pan_limit,wrap(bearing-self.uav.heading)))
-            self.radar_pan+=max(-self.config.max_pan_rate*dt,min(self.config.max_pan_rate*dt,desired-self.radar_pan))
+            if not self.config.potential_enabled:self.radar_pan+=max(-self.config.max_pan_rate*dt,min(self.config.max_pan_rate*dt,desired-self.radar_pan))
             self.bearing_error=wrap(bearing-self.uav.heading-self.radar_pan)
             self.target_visible=self.distance<=self.config.tracking_range and abs(self.bearing_error)<=self.config.tracking_half_angle
         else:
-            self.bearing_error=wrap(bearing-self.uav.heading-self.config.coverage_offset)
+            self.bearing_error=wrap(bearing-self.uav.heading-self.config.coverage_offset-(self.radar_pan if self.config.potential_enabled else 0.))
             self.target_visible=self.distance<=self.config.coverage_range and abs(self.bearing_error)<=self.config.coverage_half_angle
 
     def _safety(self,old_uav,old_ship,dt):
@@ -95,8 +162,13 @@ class BaseMaritimeEnv(gym.Env):
     def step(self,action):
         if self._done:raise RuntimeError('reset() is required before step() or after episode end')
         command=np.asarray(action,dtype=float)
-        if command.shape!=(2,) or not np.isfinite(command).all() or np.any(np.abs(command)>1.):
-            raise ValueError('action must be a finite two-vector inside [-1,1]')
+        dimension=3 if self.config.potential_enabled else 2
+        if command.shape!=(dimension,) or not np.isfinite(command).all() or np.any(np.abs(command)>1.):
+            raise ValueError(f'action must be a finite {dimension}-vector inside [-1,1]')
+        if self.config.potential_enabled:
+            limit=self.config.coverage_pan_limit if self.task=='coverage' else self.config.pan_limit
+            self.desired_radar_pan=float(command[2])*limit
+        command=command[:2]
         norm=float(np.linalg.norm(command))
         command=command/norm if norm>=1e-6 else np.array([math.cos(self.uav.heading),math.sin(self.uav.heading)])
         start=self.t;c=self.config
@@ -123,6 +195,7 @@ class BaseMaritimeEnv(gym.Env):
 
     def _info(self,elapsed):
         result={'time_seconds':self.t,'physics_tick':self.physics_tick,'elapsed_seconds':elapsed,'executed_action':np.array(self.uav_model.velocity(self.uav),dtype=np.float32)/self.config.uav_speed,'termination_reason':self.termination_reason,'uav_collision':self.uav_collision,'ship_collision':self.ship_collision,'out_of_bounds':self.out_of_bounds}
+        if self.config.potential_enabled:result['radar_pan']=self.radar_pan
         if self.task=='coverage':result.update(coverage_ratio=self.coverage_ratio,mean_age=self.mean_age,max_age=self.max_age,first_full_coverage_time=self.first_full_coverage_time,rescan_ratio=self.rescan_ratio)
         else:result.update(target_visible=self.target_visible,distance=self.distance,bearing_error=self.bearing_error,radar_pan=self.radar_pan,first_loss_time=self.first_loss_time)
         return result
@@ -147,6 +220,12 @@ class BaseMaritimeEnv(gym.Env):
             coverage['grid_bounds']=self.scene['roi']
             coverage['grid_max_age']=max(1.,self.max_age)
         frame={'t':self.t,'task':self.task,'uav':u,'ship':s,'radar':{'range':c.coverage_range if self.task=='coverage' else c.tracking_range,'half_angle':c.coverage_half_angle if self.task=='coverage' else c.tracking_half_angle,'pan':self.radar_pan,'offset':c.coverage_offset if self.task=='coverage' else 0.,'visible':self.target_visible},'coverage':coverage,'metrics':{'distance':self.distance,'bearing_error':self.bearing_error,'visible':self.target_visible,'coverage_ratio':coverage['ratio'],'mean_age':coverage['mean_age'],'max_age':coverage['max_age']},'termination_reason':self.termination_reason}
+        if c.potential_enabled:
+            field=self.potential_snapshot();radius=c.potential_radius
+            frame['potential']={'values':field[0].tolist(),'valid':field[3].tolist(),
+                'bounds':[self.uav.x-radius,self.uav.y-radius,self.uav.x+radius,self.uav.y+radius],
+                'range':[-2,1],'period':c.potential_period,'goal':None if self.public_goal is None else self.public_goal.tolist(),
+                'coordinates':'inclusive sample centers; spacing=2*radius/32'}
         if self.render_callback is not None:self.render_callback(frame)
         return frame
 

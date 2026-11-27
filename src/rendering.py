@@ -14,6 +14,16 @@ from matplotlib.collections import LineCollection, PolyCollection
 import numpy as np
 
 
+def potential_rgba(values,valid):
+    """Fixed -2/-1/+1 scale, shared with the browser's potentialColor."""
+    v=np.asarray(values,dtype=float);p=np.clip(v,-1,1);f=(p+1)/2
+    rgb=np.stack((np.rint(205-142*f),np.rint(113+98*f),np.rint(174-13*f)),axis=-1)/255
+    rgba=np.concatenate((rgb,(.08+.24*np.abs(p))[...,None]),axis=-1)
+    rgba[v<=-1.5]=[219/255,73/255,83/255,.65]
+    rgba[~(np.asarray(valid,dtype=bool)&np.isfinite(v))]=0
+    return rgba
+
+
 def _meteor_segments(positions,times,index,seconds):
     """Clip the real time window, interpolating its boundary before fading."""
     now=times[index];cutoff=now-seconds
@@ -88,6 +98,16 @@ def export_video(record, output, *, fps=24, max_frames=480, width=1440, height=9
     if task=='coverage' and roi and visual['visual_show_radar_age']:
         age_image=ax.imshow(np.zeros((1,1,4)),origin='lower',interpolation='nearest',
             extent=np.asarray([roi[0],roi[2],roi[1],roi[3]])/1000,zorder=1)
+    field_image=None;attraction_image=None
+    if visual.get('visual_show_potential',True) and any(f.get('potential') for f in frames):
+        field_image=ax.imshow(np.zeros((1,1,4)),origin='lower',interpolation='nearest',
+                              extent=[0,1,0,1],zorder=1.4)
+        if roi:
+            attraction_image=ax.imshow(np.zeros((1,1,4)),origin='lower',interpolation='nearest',
+                                       extent=[0,1,0,1],zorder=1.4)
+            attraction_image.set_clip_path(Rectangle((roi[0]/1000,roi[1]/1000),
+                (roi[2]-roi[0])/1000,(roi[3]-roi[1])/1000,transform=ax.transData))
+        fig.text(.055,.065,'LOCAL FIELD    -2 cloud    -1 repulsion    +1 attraction',color=muted,fontsize=8)
     route=np.asarray(scene.get('ship_route', []))
     if len(route):
         ax.plot(route[:,0]/1000,route[:,1]/1000,color='#708797',lw=.7,ls=':',alpha=.6)
@@ -179,6 +199,19 @@ def export_video(record, output, *, fps=24, max_frames=480, width=1440, height=9
             radar.set_theta1(center-math.degrees(r['half_angle']))
             radar.set_theta2(center+math.degrees(r['half_angle']))
             c=f.get('coverage',{});m=f.get('metrics',{})
+            if field_image is not None:
+                field=f.get('potential',{})
+                values=np.asarray(field.get('values',[]),dtype=float)
+                if values.ndim==2 and values.size and len(field.get('bounds',[]))==4:
+                    colors=potential_rgba(values,field.get('valid',np.ones_like(values)))
+                    if attraction_image is not None:
+                        positive=colors.copy();positive[values<=0]=0
+                        negative=colors.copy();negative[values>0]=0
+                        field_image.set_data(negative);attraction_image.set_data(positive)
+                    else:field_image.set_data(colors)
+                    fb=field['bounds'];hx=(fb[2]-fb[0])/max(1,values.shape[1]-1)/2;hy=(fb[3]-fb[1])/max(1,values.shape[0]-1)/2
+                    field_image.set_extent(np.asarray([fb[0]-hx,fb[2]+hx,fb[1]-hy,fb[3]+hy])/1000)
+                    if attraction_image is not None:attraction_image.set_extent(field_image.get_extent())
             if age_image is not None:
                 grid=np.asarray(c.get('grid',[]),dtype=float)
                 if grid.ndim==2 and grid.size:

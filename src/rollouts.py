@@ -116,6 +116,8 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     rng=np.random.default_rng(seed if mixture_seed is None else mixture_seed)
     scene_spec = json_value(env.scene)
     task = env.task
+    field_mode = bool(getattr(env.config, 'potential_enabled', False))
+    action_shape = (3,) if field_mode else (2,)
     scene_id = hashlib.sha256(json.dumps(scene_spec, sort_keys=True,
         separators=(',', ':'), allow_nan=False).encode()).hexdigest()
     layout = {key:scene_spec.get(key) for key in
@@ -145,7 +147,7 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
             if expert_labeler is not None:
                 policy_action=action.copy()
                 expert_action=np.asarray(expert_labeler.act(obs),dtype=np.float32)
-                if expert_action.shape!=(2,) or not np.isfinite(expert_action).all():
+                if expert_action.shape!=action_shape or not np.isfinite(expert_action).all():
                     raise ValueError('Expert label must be a finite direction')
                 if rng.random()<mixture_beta:
                     action=expert_action.copy();expert_controls+=1
@@ -156,7 +158,7 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
             if type(error).__name__ not in {'ExpertPlanningError','PlanningError','NoFeasibleAction'}:
                 unexpected_error = error
             break
-        if action.shape != (2,) or not np.isfinite(action).all():
+        if action.shape != action_shape or not np.isfinite(action).all():
             raise ValueError(f'{actor_name} returned an invalid action at step {step_index}')
         obs, _, terminated, truncated, info = env.step(action)
         frame = json_value(env.render())
@@ -166,7 +168,11 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
             expert_actions.append(expert_action.tolist());policy_actions.append(policy_action.tolist())
         u = frame['uav']
         speed = math.hypot(u['vx'], u['vy'])
-        executed.append([u['vx'] / speed, u['vy'] / speed])
+        actual = [u['vx'] / speed, u['vy'] / speed]
+        if field_mode:
+            limit = env.config.coverage_pan_limit if task == 'coverage' else env.config.pan_limit
+            actual.append(float(frame['radar']['pan']) / limit)
+        executed.append(actual)
         if record_observations:
             for k, value in obs.items():
                 sequences[k].append(np.array(value, copy=True))
@@ -194,9 +200,12 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     metadata = {'scene_id': scene_id, 'scene_group_id':scene_group_id,
                 'expert_valid':expert_valid,
                 'task': task, 'seed': int(seed),
-                'actor': actor_name, 'obs_schema': 'obs-v1', 'schema_version': REPLAY_SCHEMA,
+                'actor': actor_name, 'obs_schema': 'obs-field-v2' if field_mode else 'obs-v1', 'schema_version': REPLAY_SCHEMA,
                 'config': json_value(env.config),
                 'config_hash':getattr(env.config,'config_hash',None)}
+    if field_mode:
+        metadata.update(dataset_version='bc-dataset-field-v2', observation_schema='obs-field-v2',
+                        action_schema='action-field-v2')
     if getattr(actor,'checkpoint_metadata',None):
         metadata['policy_checkpoint']=json_value(actor.checkpoint_metadata)
     record = {'schema_version': REPLAY_SCHEMA, 'task': task, 'actor': actor_name,

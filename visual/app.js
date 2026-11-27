@@ -16,6 +16,8 @@ function scheduleRender() { renderQueued = true; trendDirty = true; }
 function updateLayerControls() {
   $('show-grid').checked=map.showGrid;$('show-trail').checked=map.showTrail;
   $('show-age').checked=map.showAge;$('show-age').parentElement.hidden=state.task!=='coverage';
+  $('show-potential').checked=map.showPotential;
+  $('potential-key').hidden=!map.showPotential||!state.replay?.frames?.[state.index]?.potential;
   $('age-key').hidden=state.task!=='coverage'||!map.showAge;
   $('trail-style').value=map.trailStyle;$('trail-style').disabled=!map.showTrail;
   $('trail-style').querySelector('[value="meteor"]').textContent=`流星尾迹 · ${map.config.visual_trail_seconds}s`;
@@ -152,6 +154,7 @@ function render() {
   renderQueued=false;
   const replay=state.replay,frames=replay?.frames||[],frame=frames[state.index],coverage=frame?.coverage||{},radar=frame?.radar||{},metrics=frame?.metrics||{};
   const hasFrame=Boolean(frame);
+  $('potential-key').hidden=!map.showPotential||!frame?.potential;
   $('empty-state').hidden=hasFrame;
   $('data-label').textContent=hasFrame?(state.mode==='live'?'LIVE':'REPLAY'):'无数据';
   $('data-label').style.color=hasFrame?'var(--cyan)':'';
@@ -271,6 +274,7 @@ document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener
 }));
 $('zoom-in').addEventListener('click',()=>map.adjustZoom(1.4));$('zoom-out').addEventListener('click',()=>map.adjustZoom(1/1.4));$('reset-view').addEventListener('click',()=>map.reset());
 $('show-age').addEventListener('change',()=>{map.setLayerOptions({showAge:$('show-age').checked});updateLayerControls();});
+$('show-potential').addEventListener('change',()=>{map.setLayerOptions({showPotential:$('show-potential').checked});updateLayerControls();});
 $('show-grid').addEventListener('change',()=>{map.setLayerOptions({showGrid:$('show-grid').checked});updateLayerControls();});
 $('show-trail').addEventListener('change',()=>{map.setLayerOptions({showTrail:$('show-trail').checked});updateLayerControls();});
 $('trail-style').addEventListener('change',()=>map.setLayerOptions({trailStyle:$('trail-style').value}));

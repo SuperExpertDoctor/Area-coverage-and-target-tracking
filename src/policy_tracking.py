@@ -151,6 +151,8 @@ class NeuralPolicy:
 
     @torch.inference_mode()
     def act(self, obs):
+        if "potential" in obs or "field_context" in obs:
+            raise ValueError("obs-field-v2 observation requires a field-v2 checkpoint; protocol mismatch")
         if "vector" not in obs:
             raise ValueError("observation requires vector")
         expected = {"vector": (self.model.vector_dim,)}
@@ -176,16 +178,27 @@ class NeuralPolicy:
         source = Path(path).resolve()
         payload = source.read_bytes()
         checkpoint = torch.load(io.BytesIO(payload), map_location=device, weights_only=False)
-        if checkpoint.get("checkpoint_version") != "bc-v1":
+        field_mode = checkpoint.get("checkpoint_version") == "bc-field-v2"
+        if checkpoint.get("checkpoint_version") not in {"bc-v1", "bc-field-v2"}:
             raise ValueError("unsupported behavior-cloning checkpoint version")
-        if checkpoint.get("observation_schema") != "obs-v1":
+        expected_schema = "obs-field-v2" if field_mode else "obs-v1"
+        if checkpoint.get("observation_schema") != expected_schema:
             raise ValueError("checkpoint observation schema is incompatible")
+        if field_mode and checkpoint.get("action_schema") != "action-field-v2":
+            raise ValueError("checkpoint action schema is incompatible")
         model_config = dict(checkpoint["model_config"])
-        model_config.setdefault("action_frame", "world")  # pre-body-head checkpoints
-        model_config.setdefault("feature_frame", "world")  # pre-body-feature checkpoints
+        if bool(model_config.get("potential_field", False)) != field_mode:
+            raise ValueError("checkpoint model config and schema protocol disagree")
+        if not field_mode:
+            model_config.setdefault("action_frame", "world")  # pre-body-head checkpoints
+            model_config.setdefault("feature_frame", "world")  # pre-body-feature checkpoints
         model = create_policy(checkpoint["task"], model_config)
         model.load_state_dict(checkpoint["model_state_dict"])
-        policy = cls(model, device=device)
+        if field_mode:
+            from .policy_field import FieldNeuralPolicy
+            policy = FieldNeuralPolicy(model, device=device)
+        else:
+            policy = cls(model, device=device)
         policy.checkpoint_metadata = {'path':str(source), 'sha256':hashlib.sha256(payload).hexdigest(),
                                       'epoch':checkpoint.get('epoch'), 'model_config':model.model_config}
         return policy

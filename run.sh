@@ -2,13 +2,14 @@
 set -euo pipefail
 # All tunable simulation, expert, training and export values live in this entry.
 # Usage: bash run.sh [all|expert|expert-validate|collect|train|dagger|evaluate|serve] [extra main.py flags]
+# SIM_CONFIG.potential_enabled selects the protocol; --potential-field / --no-potential-field explicitly override it.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 PYTHON="${PYTHON:-python}"
 MODE="${1:-all}"
 if (($#)); then shift; fi
-OUTPUT_DIR="outputs"
-TF_LOG_DIR="tf-logs"
+OUTPUT_DIR="outputs/field-v2"
+TF_LOG_DIR="tf-logs/field-v2"
 RUN_NAME="$(date +%Y%m%d-%H%M%S)"
 # Optional explicit inputs. Empty strings use the task's standard output paths.
 CHECKPOINT_PATH=""
@@ -27,6 +28,28 @@ SIM_CONFIG=$(cat <<'JSON'
   "roi_max_size": 20000.0,
   "roi_outer_buffer": 6000.0,
   "coverage_grid": 64,
+  "potential_enabled": true,
+  "potential_radius": 6000.0,
+  "potential_period": 3600.0,
+  "potential_decay": 3.0,
+  "coverage_pan_limit": 1.0471975511965976,
+  "potential_goal_hold_seconds": 180.0,
+  "potential_goal_radius": 1500.0,
+  "potential_unseen_bonus": 2.0,
+  "field_heading_offsets": [0.0, -0.18, 0.18, -0.36, 0.36],
+  "field_prediction_seconds": 8.0,
+  "field_path_samples": 4,
+  "field_guidance_weight": 2.0,
+  "field_scan_weight": 1.4,
+  "field_preference_weight": 0.2,
+  "field_roi_weight": 0.3,
+  "field_turn_weight": 0.05,
+  "field_obstacle_weight": 1.0,
+  "field_obstacle_influence": 2500.0,
+  "field_tracking_repulsion_limit": 0.12,
+  "field_pan_samples": 9,
+  "field_pan_goal_weight": 0.6,
+  "field_pan_slew_weight": 0.05,
   "cloud_min_count": 2,
   "cloud_max_count": 6,
   "max_clouds": 8,
@@ -162,6 +185,7 @@ SIM_CONFIG=$(cat <<'JSON'
   "visual_show_grid": true,
   "visual_show_trail": true,
   "visual_show_radar_age": true,
+  "visual_show_potential": true,
   "visual_trail_style": "meteor"
 }
 JSON
@@ -171,22 +195,23 @@ if [[ -n "$CHECKPOINT_PATH" ]]; then INPUT_ARGS+=(--checkpoint-path "$CHECKPOINT
 if [[ -n "$DATASET_MANIFEST" ]]; then INPUT_ARGS+=(--dataset-manifest "$DATASET_MANIFEST"); fi
 exec "$PYTHON" main.py \
   --mode "$MODE" --task both \
-  --config-json "$SIM_CONFIG" \
+  --config-json "$SIM_CONFIG" --field-mask-previous-command --field-frame body --field-pan-residual --tracking-pan-reference goal --coverage-pan-reference goal --coverage-direction-reference goal_orbit --tracking-direction-reference goal_orbit \
+  --closed-loop-selection --selection-coverage-seconds 10800 --selection-tracking-seconds 1800 --selection-render-every 60 --selection-workers 2 --selection-tracking-pan-stress 0.3490658503988659 \
   --output-dir "$OUTPUT_DIR" --tf-log-dir "$TF_LOG_DIR" --run-name "$RUN_NAME" \
   --visualize --open-browser --keep-server --host 127.0.0.1 --port 8787 \
   --render-every 5 --realtime-factor 0 --progress-every 300 \
-  --expert-seed 7100 --collection-seed 1000 \
+  --expert-seed 7100 --collection-seed 12000 \
   --episodes 8 --collection-attempt-multiplier 3 \
-  --collection-coverage-seconds 5400 --collection-tracking-seconds 1800 \
-  --epochs 30 --batch-size 4 --sequence-length 64 \
+  --collection-coverage-seconds 7200 --collection-tracking-seconds 1800 \
+  --epochs 40 --batch-size 4 --sequence-length 256 \
   --learning-rate 0.0003 --weight-decay 0.00001 --grad-clip 1 \
   --validation-fraction 0.25 --training-seed 42 \
   --hidden-size 128 --heading-residual --action-frame body --feature-frame auto --normalize-vectors --normalization-min-std 0.1 \
-  --correction-weight-max 1 --correction-threshold 0.1 \
+  --correction-weight-max 4 --correction-threshold 0.1 --dagger-recovery-min-steps 7200 \
   --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
   --no-coverage-mask-previous-command \
   --device auto --inference-device cpu --num-threads 1 \
-  --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-max-steps 0 --no-dagger-collect-only \
+  --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-initial-pan-jitter 0 --dagger-max-steps 0 --no-dagger-collect-only \
   --validation-coverage-seeds 2000 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 3014 3015 3016 3017 3018 3019 3020 3021 3022 3023 3024 3025 3026 3027 3028 \
   --validation-boundary-seeds 4000 4001 4002 --validation-boundary-starts 8 \
   --validation-tracking-seeds 5000 5001 5002 5003 5004 5005 5006 5007 5008 5009 \

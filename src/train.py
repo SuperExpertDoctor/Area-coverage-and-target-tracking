@@ -5,13 +5,13 @@ batch_size=32, sequence_length=32, learning_rate=3e-4, weight_decay=1e-5,
 grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128, device='cpu',
 num_threads=1, model_config=None, metadata=None, normalize_vectors=True,
 normalization_min_std=.1, initial_checkpoint=None,
-correction_weight_max=1., correction_threshold=.1)``
+correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0)``
 
 An episode begins with zero hidden state. Its contiguous TBPTT chunks carry
 ``hidden.detach()``. Episodes, never individual fragments, are shuffled. Loss is
-mean squared XY vector distance per valid step; Action_MSE divides that by two,
-and Action_MAE is mean absolute error per component. Neither is an accuracy or
-likelihood. Validation always starts from each episode's real first observation.
+mean squared action distance per valid step; field-v2 includes normalized pan.
+Action_MSE and Action_MAE divide by the actual number of valid components.
+Neither is an accuracy or likelihood. Validation starts at the true episode start.
 """
 
 import hashlib
@@ -25,7 +25,8 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from .datasets import SequenceDataset, pad_episodes, read_episode_metadata, split_episodes
+from .datasets import (FIELD_ACTION_SCHEMA, FIELD_OBSERVATION_SCHEMA, SequenceDataset,
+                       pad_episodes, read_episode_metadata, split_episodes)
 from .policy_coverage import CoveragePolicy
 from .policy_tracking import TrackingPolicy
 
@@ -33,7 +34,16 @@ from .policy_tracking import TrackingPolicy
 def create_policy(task, config=None, **kwargs):
     """Create fresh independent task weights; config contains model arguments only."""
     options = dict(config or {})
+    options.update(kwargs.pop("model_config", None) or {})
     options.update(kwargs)
+    if options.pop("potential_field", False):
+        from .policy_field import FieldPolicy
+        # Legacy experiment flags cannot reinterpret the explicit field_frame
+        # architecture or select the unrelated legacy coverage map encoder.
+        for key in ["heading_residual", "action_frame", "feature_frame", "ego_map_channels",
+                    "ego_map_sigma", "ego_map_mode"]:
+            options.pop(key, None)
+        return FieldPolicy(task, **options)
     if task == "coverage":
         return CoveragePolicy(**options)
     if task == "tracking":
@@ -72,6 +82,38 @@ def _fit_vector_normalization(dataset, model, minimum_std=.1):
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def _training_sample_order(dataset, minimum_steps=0):
+    """Replay complete accepted DAgger prefixes; never join unrelated histories.
+
+    Splitting and normalization still use unique episodes. Only training draws
+    change; each repeated episode starts with zero hidden state in _run_epoch.
+    The budget is a minimum number of action exposures, not synthetic steps.
+    """
+    if isinstance(minimum_steps, (bool, np.bool_)) or not isinstance(minimum_steps, (int, np.integer)) or minimum_steps < 0:
+        raise ValueError("dagger_recovery_min_steps must be a nonnegative integer")
+    order = []
+    repeated = []
+    total_steps = 0
+    if minimum_steps == 0:
+        return np.arange(len(dataset)), dict(unique_episodes=len(dataset), episode_draws=len(dataset),
+                                           expected_action_steps=None, repeated_episodes=[])
+    for index, path in enumerate(dataset.paths):
+        metadata = read_episode_metadata(path)
+        with np.load(path, allow_pickle=False) as arrays:
+            length = len(arrays["actions"])
+        if length < 1:
+            raise ValueError(f"episode {path} has no action labels")
+        recovery = metadata.get("behavior") == "dagger_training" and metadata.get("accepted_prefix") is True
+        copies = max(1, math.ceil(minimum_steps / length)) if recovery else 1
+        order.extend([index] * copies)
+        total_steps += length * copies
+        if copies > 1:
+            repeated.append(dict(path=str(path), action_steps=length, copies=copies,
+                                 expected_action_steps=length * copies))
+    return np.asarray(order, dtype=np.int64), dict(unique_episodes=len(dataset), episode_draws=len(order),
+                                                  expected_action_steps=total_steps, repeated_episodes=repeated)
+
+
 def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=None,
                grad_clip=1., order=None, correction_weight_max=1., correction_threshold=.1):
     """Encode map chunks only, carrying causal state across contiguous chunks."""
@@ -81,6 +123,7 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
     squared_sum = absolute_sum = 0.
     objective_sum = objective_weight_sum = 0.
     valid_steps = 0
+    valid_components = 0
     for offset in range(0, len(indices), batch_size):
         episodes = [dataset[index] for index in indices[offset:offset + batch_size]]
         maximum = max(len(episode["actions"]) for episode in episodes)
@@ -103,7 +146,7 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                     # This is the previous command in raw common observations,
                     # not current heading, executed velocity or normalized MLP input.
                     correction = torch.linalg.vector_norm(
-                        batch["actions"] - batch["vector"][..., 8:10], dim=-1) > correction_threshold
+                        batch["actions"][..., :2] - batch["vector"][..., 8:10], dim=-1) > correction_threshold
                     weights = torch.ones_like(batch["mask"], dtype=error.dtype)
                     weights = torch.where(correction, weights * correction_weight_max, weights)
                     weights = weights * batch["mask"]
@@ -126,11 +169,12 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
             objective_sum += float(objective.detach().item())
             objective_weight_sum += float(weight_count.detach().item() if torch.is_tensor(weight_count) else weight_count)
             valid_steps += step_count
+            valid_components += step_count * error.shape[-1]
     if valid_steps == 0:
         raise ValueError("dataset contains no usable action steps")
     return dict(loss=objective_sum / objective_weight_sum,
-                action_mse=squared_sum / (2 * valid_steps),
-                action_mae=absolute_sum / (2 * valid_steps), steps=valid_steps)
+                action_mse=squared_sum / valid_components,
+                action_mae=absolute_sum / valid_components, steps=valid_steps)
 
 
 def _write_json(path, value):
@@ -219,12 +263,15 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                  grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128,
                  device="cpu", num_threads=1, model_config=None, metadata=None,
                  normalize_vectors=True, normalization_min_std=.1, initial_checkpoint=None,
-                 correction_weight_max=1., correction_threshold=.1):
+                 correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0):
     """Train one task, write six meaningful TensorBoard metrics and best/last files.
 
     ``model_config`` accepts ``vector_dim``, ``hidden_size`` and
     ``heading_residual``, ``action_frame`` ('body' by default or 'world') and
     ``feature_frame`` ('body' by default; coverage retains its world map heading).
+    ``potential_field=True`` selects field-v2's world-aligned CNN/context/GRU
+    and three-component actions. Legacy frame/map flags are ignored in that
+    mode. Its previous-command mask defaults True and can be set explicitly.
     Coverage also accepts ego_map_channels=False and ego_map_sigma=2 grid cells.
     A 3→6 map-channel warm-start requires explicit upgrade_coverage_checkpoint
     conversion; ordinary warm-start rejects incompatible architecture settings.
@@ -233,7 +280,9 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     saved unchanged alongside representative dataset metadata. Setting validation
     fraction to zero explicitly disables validation; best then uses training loss,
     validation results are None, and no validation scalars are fabricated. With
-    validation disabled best selection uses unweighted training Action_MSE.
+    validation disabled best selection uses unweighted training Action_MSE;
+    when training draws repeat episodes, candidates are evaluated on the unique
+    training episodes after updates so epoch-zero and later scores are comparable.
     normalization_min_std floors nonconstant train standard deviations in the
     physically scaled feature space; 0 recovers ordinary feature standardization.
     initial_checkpoint warm-starts model weights and normalization with a fresh
@@ -248,6 +297,10 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     weight 1. Loss is the weighted squared XY vector distance divided by valid
     weight sum. The default max=1 exactly disables weighting. Initial epoch 0,
     all validation metrics, and Train/Action_MSE/MAE remain unweighted.
+    dagger_recovery_min_steps repeats complete accepted DAgger prefixes to a
+    minimum training exposure budget. Each draw resets recurrent state; unique
+    episodes determine normalization and splits. Epoch zero and validation do
+    not resample. Training metrics describe the actual training draws.
 
     Returns JSON-safe initial/best validation MSE, initial validation metrics,
     checkpoint paths, history (epoch/Train/Validation), split and train config.
@@ -290,16 +343,26 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         initial_bytes = initial_requested_path.read_bytes()
         initial_sha256 = hashlib.sha256(initial_bytes).hexdigest()
         initial_state = torch.load(io.BytesIO(initial_bytes), map_location="cpu", weights_only=False)
-        if initial_state.get("checkpoint_version") != "bc-v1":
+        checkpoint_field = initial_state.get("checkpoint_version") == "bc-field-v2"
+        if initial_state.get("checkpoint_version") not in {"bc-v1", "bc-field-v2"}:
             raise ValueError("initial checkpoint has an incompatible checkpoint version")
-        if initial_state.get("observation_schema") != "obs-v1":
+        expected_schema = FIELD_OBSERVATION_SCHEMA if checkpoint_field else "obs-v1"
+        if initial_state.get("observation_schema") != expected_schema:
             raise ValueError("initial checkpoint observation schema is incompatible")
+        if checkpoint_field and initial_state.get("action_schema") != FIELD_ACTION_SCHEMA:
+            raise ValueError("initial checkpoint action schema is incompatible")
+        if bool(initial_state.get("model_config", {}).get("potential_field", False)) != checkpoint_field:
+            raise ValueError("initial checkpoint architecture and schema protocol disagree")
         if initial_state.get("task") != task:
             raise ValueError("initial checkpoint task does not match training task")
         options = dict(initial_state["model_config"])
-        options.setdefault("action_frame", "world")
-        options.setdefault("feature_frame", "world")
+        if not checkpoint_field:
+            options.setdefault("action_frame", "world")
+            options.setdefault("feature_frame", "world")
         for key, value in (model_config or {}).items():
+            if checkpoint_field and key in {"heading_residual", "action_frame", "feature_frame", "ego_map_channels",
+                                             "ego_map_sigma", "ego_map_mode"}:
+                continue
             if key not in options or options[key] != value:
                 raise ValueError(f"initial checkpoint model config mismatch for {key}")
         initial_path = (output_dir / "initial-checkpoints" / f"{initial_sha256}.pt").resolve()
@@ -313,14 +376,18 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     else:
         options = dict(hidden_size=hidden_size)
         options.update(model_config or {})
+    field_mode = bool(options.get("potential_field", False))
+    observation_schema = FIELD_OBSERVATION_SCHEMA if field_mode else "obs-v1"
+    action_schema = FIELD_ACTION_SCHEMA if field_mode else "action-v1"
     split = split_episodes(dataset_dir, task, validation_fraction=0 if initial_state is not None else validation_fraction,
-                           seed=seed)
+                           seed=seed, observation_schema=observation_schema)
     if initial_state is not None:
         if not 0 <= validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0,1)")
         split = _preserve_scene_assignments(split, initial_state.get("dataset_split"), validation_fraction, seed)
-    train_dataset = SequenceDataset(split["train_paths"], task=task)
-    validation_dataset = SequenceDataset(split["validation_paths"], task=task)
+    train_dataset = SequenceDataset(split["train_paths"], task=task, observation_schema=observation_schema)
+    validation_dataset = SequenceDataset(split["validation_paths"], task=task, observation_schema=observation_schema)
+    training_order, sampling_report = _training_sample_order(train_dataset, dagger_recovery_min_steps)
     model = create_policy(task, options).to(target_device)
     if model.vector_dim != train_dataset.vector_dim:
         raise ValueError("model vector dimension does not match the task observation schema")
@@ -349,13 +416,20 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     train_config["initial_checkpoint_requested"] = None if initial_requested_path is None else str(initial_requested_path)
     train_config["correction_weight_max"] = float(correction_weight_max)
     train_config["correction_threshold"] = float(correction_threshold)
+    train_config["dagger_recovery_min_steps"] = int(dagger_recovery_min_steps)
+    train_config["training_sampling"] = sampling_report
     loss_definition = dict(
-        training="sum(valid * weight * squared_world_xy_vector_error) / sum(valid * weight)",
-        correction="norm(expert_action - raw_vector[8:10]) > correction_threshold",
+        training=("sum(valid * weight * squared_world_xy_and_normalized_pan_error) / sum(valid * weight)"
+                  if field_mode else "sum(valid * weight * squared_world_xy_vector_error) / sum(valid * weight)"),
+        correction="norm(expert_action_xy - raw_vector[8:10]) > correction_threshold",
         weight="correction_weight_max on correction steps; otherwise 1",
         previous_command="raw observed last command, not actual velocity",
-        epoch_zero="unweighted", validation="unweighted", action_mse_mae="unweighted")
+        epoch_zero="unweighted", validation="unweighted", action_mse_mae="unweighted",
+        training_sampling="complete accepted DAgger prefix repeats; independent recurrent resets",
+        evaluation_sampling="unique original episodes, no repeats")
     train_config["loss_definition"] = loss_definition
+    train_config.update(observation_schema=observation_schema, action_schema=action_schema,
+                        action_dim=train_dataset.action_dim)
     normalization = dict(method="train_feature_standardization" if normalize_vectors else "identity",
                          fit_subset="train", vector_mean=model.vector_mean.cpu().tolist(),
                          vector_std=model.vector_std.cpu().tolist(),
@@ -368,6 +442,18 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                          if model.action_frame == "body" else (
                              "normalize(tanh(head+atanh(0.5*heading)))" if model.heading_residual
                              else "normalize(tanh(head))"), zero_fallback="vector[2:4]")
+    if field_mode:
+        normalization.update(local_field="physical signed field and semantic masks; no image normalization",
+                             field_context="physical scales defined by obs-field-v2",
+                             pan=("tanh(pan_head + atanh(clamp(observed_actual_pan/task_pan_limit,-.99,.99)))"
+                                  if model.pan_residual else "tanh(pan_head)"),
+                             field_frame=model.field_frame)
+        normalization["pan_reference"] = model.pan_reference
+        normalization["direction_reference"] = model.direction_reference
+        if model.direction_reference == "goal_orbit":
+            normalization["direction"] = "normalize(tanh(direction_head + atanh(0.5*public_goal_orbit_reference))) rotated to world"
+        if model.pan_residual and model.pan_reference == "goal":
+            normalization["pan"] = "tanh(pan_head + atanh(clamp(observed_goal_bearing/task_pan_limit,-.99,.99)))"
     if initial_state is not None:
         saved_normalization = initial_state.get("normalization", {})
         normalization.update(method=saved_normalization.get("method", "checkpoint_buffers"),
@@ -385,8 +471,9 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     best_mse = (initial_validation or initial_train)["action_mse"]
     best_epoch = 0
 
-    def save_checkpoint(path, epoch, train_metrics, validation_metrics):
-        torch.save(dict(checkpoint_version="bc-v1", observation_schema="obs-v1", task=task,
+    def save_checkpoint(path, epoch, train_metrics, validation_metrics, selection_metrics=None):
+        torch.save(dict(checkpoint_version="bc-field-v2" if field_mode else "bc-v1",
+                        observation_schema=observation_schema, action_schema=action_schema, task=task,
                         model_config=model.model_config, model_state_dict=model.state_dict(),
                         optimizer_state_dict=optimizer.state_dict(), epoch=epoch, seed=int(seed),
                         normalization=normalization, train_config=train_config,
@@ -394,6 +481,8 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                         dataset_split=split, train_metrics=train_metrics,
                         loss_definition=loss_definition,
                         validation_metrics=validation_metrics,
+                        selection_metrics=selection_metrics or validation_metrics or train_metrics,
+                        selection_subset="validation_unique" if len(validation_dataset) else "train_unique",
                         initial_checkpoint=None if initial_path is None else str(initial_path),
                         initial_checkpoint_sha256=initial_sha256,
                         initial_checkpoint_epoch=None if initial_state is None else initial_state.get("epoch"),
@@ -417,18 +506,22 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
             log_metrics("Validation", initial_validation, 0)
         print_progress(0, initial_train, initial_validation)
         for epoch in range(1, epochs + 1):
-            order = rng.permutation(len(train_dataset)).tolist()
+            order = rng.permutation(training_order).tolist()
             train_metrics = _run_epoch(model, train_dataset, batch_size, sequence_length,
                                        target_device, optimizer=optimizer, grad_clip=grad_clip, order=order,
                                        correction_weight_max=correction_weight_max,
                                        correction_threshold=correction_threshold)
             validation_metrics = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device)
                                   if len(validation_dataset) else None)
-            score = (validation_metrics or train_metrics)["action_mse"]
+            selection_metrics = validation_metrics
+            if selection_metrics is None:
+                selection_metrics = (_run_epoch(model, train_dataset, batch_size, sequence_length, target_device)
+                                     if len(training_order) > len(train_dataset) else train_metrics)
+            score = selection_metrics["action_mse"]
             if score < best_mse:
                 best_mse, best_epoch = score, epoch
-                save_checkpoint(best_path, epoch, train_metrics, validation_metrics)
-            save_checkpoint(last_path, epoch, train_metrics, validation_metrics)
+                save_checkpoint(best_path, epoch, train_metrics, validation_metrics, selection_metrics)
+            save_checkpoint(last_path, epoch, train_metrics, validation_metrics, selection_metrics)
             log_metrics("Train", train_metrics, epoch)
             if validation_metrics is not None:
                 log_metrics("Validation", validation_metrics, epoch)

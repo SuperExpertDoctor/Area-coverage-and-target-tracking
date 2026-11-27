@@ -12,3 +12,9 @@
 @media(max-width:1150px){.layer-toolbar{gap:11px;padding:7px 13px}.grid-summary{font-size:8px}.layer-toolbar select{font-size:9px}.layer-toolbar{font-size:9px}}
 @media(max-width:850px){.layer-toolbar{font-size:10px;gap:14px;min-height:42px}.layer-toolbar select{font-size:10px}.grid-summary{font-size:9px}.map-container{height:55vh}}
 @media(max-width:520px){.layer-toolbar{padding:8px 11px;gap:8px 12px;flex-wrap:wrap;min-height:72px;font-size:9px}.layer-toolbar select{font-size:9px;padding-right:19px;min-height:25px}.layer-separator{display:none}.grid-summary{font-size:8px;margin-left:0;width:100%;line-height:1.4}.layer-toolbar>label[for=trail-style]{display:none}.map-legend{gap:9px;font-size:8px}.map-container{height:54vh}.legend-line{width:12px}.legend-visit{width:10px}.age-key{font-size:8px}}
+/* The field legend keeps one fixed physical preference scale across replays. */
+.potential-key {position:absolute;left:20px;bottom:94px;display:flex;gap:14px;padding:7px 10px;border:1px solid #75949133;border-radius:6px;background:#081923df;font-size:10px;color:#dcebf1;pointer-events:none}
+.potential-key[hidden] {display:none}
+.potential-key span::before {content:"";display:inline-block;width:8px;height:8px;margin-right:5px;border-radius:2px;background:#db4953}
+.potential-key span:nth-child(2)::before {background:#cd71ae}
+.potential-key span:nth-child(3)::before {background:#3fd3a1}

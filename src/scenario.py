@@ -96,7 +96,8 @@ def validate_scene(scene,config,task=None):
                 raise SceneValidationError('Ship route crosses an inflated island')
         if math.dist(route[0],(s.x,s.y))>1:
             raise SceneValidationError('Ship initial state does not match route start')
-        if not math.isfinite(scene['radar_pan_initial']) or abs(scene['radar_pan_initial'])>config.pan_limit:
+        pan_limit=config.coverage_pan_limit if config.potential_enabled and scene['task']=='coverage' else config.pan_limit
+        if not math.isfinite(scene['radar_pan_initial']) or abs(scene['radar_pan_initial'])>pan_limit:
             raise SceneValidationError('Invalid initial radar pan')
         if not math.isfinite(scene['episode_seconds']) or scene['episode_seconds']<=0:
             raise SceneValidationError('Invalid episode duration')

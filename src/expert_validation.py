@@ -46,9 +46,10 @@ def _write_json(path, value, *, compact=False):
 
 def _source_fingerprint():
     root = Path(__file__).parent
-    names = ('dynamics.py', 'geometry.py', 'navigation.py', 'scenario.py',
+    names = ('config.py', 'dynamics.py', 'geometry.py', 'navigation.py', 'scenario.py',
              'observations.py', 'env_base.py', 'env_coverage.py', 'env_tracking.py',
-             'expert_coverage.py', 'expert_tracking.py', 'expert_validation.py')
+             'expert_coverage.py', 'expert_tracking.py', 'expert_validation.py',
+             'potential_field.py', 'expert_field.py')
     hashes = {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in names}
     digest = hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest()
     return digest, hashes
@@ -141,6 +142,9 @@ def execute_case(job, config_dict, output_dir, trajectory_every=60., coverage_su
     result_path = out/'results'/f'{stem}.json'
     env = (CoverageEnv if job['task'] == 'coverage' else TrackingEnv)(config)
     actor = (CoverageExpert if job['task'] == 'coverage' else TrackingExpert)(config)
+    if config.potential_enabled:
+        from expert_field import FieldCoverageExpert, FieldTrackingExpert
+        actor=(FieldCoverageExpert if job['task']=='coverage' else FieldTrackingExpert)(config)
     scene = deepcopy(job.get('scene'))
     scene_file = out/'scenes'/f'{case_id}.json'
     if scene is None and scene_file.exists():
@@ -187,7 +191,11 @@ def execute_case(job, config_dict, output_dir, trajectory_every=60., coverage_su
             frame = env.render()
             frames.append(frame)
             speed = math.hypot(frame['uav']['vx'], frame['uav']['vy'])
-            executed.append([frame['uav']['vx']/speed, frame['uav']['vy']/speed])
+            actual=[frame['uav']['vx']/speed, frame['uav']['vy']/speed]
+            if config.potential_enabled:
+                limit=config.coverage_pan_limit if job['task']=='coverage' else config.pan_limit
+                actual.append(frame['radar']['pan']/limit)
+            executed.append(actual)
         summary = env.summary()
         summary.update(steps=len(actions), terminated=bool(terminated or failure),
                        truncated=bool(truncated), wall_seconds=time.perf_counter()-start)
@@ -218,7 +226,7 @@ def execute_case(job, config_dict, output_dir, trajectory_every=60., coverage_su
                 'case_id': case_id, 'kind': job['kind'], 'expert_valid': passed,
                 'source_id': source_id, 'source_hashes': source_hashes,
                 'physical_config_hash': config_hash, 'validation_id': validation_id,
-                'config': config.to_dict(), 'obs_schema': 'obs-v1',
+                'config': config.to_dict(), 'obs_schema': 'obs-field-v2' if config.potential_enabled else 'obs-v1',
                 'action_sha256': action_sha256, 'action_hash_encoding': 'row-major little-endian float32',
                 'start_index': job.get('start_index'), 'start_count': job.get('start_count')}
     result = {'case_id': case_id, 'task': job['task'], 'kind': job['kind'],

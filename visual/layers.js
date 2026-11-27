@@ -7,7 +7,26 @@ export const VISUAL_DEFAULTS = Object.freeze({
   visual_uav_min_pixels:12, visual_ship_min_pixels:8,
   visual_trail_seconds:60, visual_show_grid:true, visual_show_trail:true, visual_show_radar_age:true,
   visual_trail_style:'meteor',
+  visual_show_potential:true,
 });
+
+export function potentialCellBounds(field,row,col,roi=null) {
+  const b=field.bounds,rows=field.values.length,cols=field.values[0].length;
+  const dx=(b[2]-b[0])/Math.max(1,cols-1),dy=(b[3]-b[1])/Math.max(1,rows-1);
+  const rect=[b[0]+(col-.5)*dx,b[1]+(row-.5)*dy,b[0]+(col+.5)*dx,b[1]+(row+.5)*dy];
+  if(roi&&field.values[row][col]>0) {
+    rect[0]=Math.max(rect[0],roi[0]);rect[1]=Math.max(rect[1],roi[1]);
+    rect[2]=Math.min(rect[2],roi[2]);rect[3]=Math.min(rect[3],roi[3]);
+  }
+  return rect[2]>rect[0]&&rect[3]>rect[1]?rect:null;
+}
+
+export function potentialColor(value, valid=true) {
+  if(!valid||!Number.isFinite(value))return [0,0,0,0];
+  if(value<=-1.5)return [219,73,83,.65];
+  const p=Math.max(-1,Math.min(1,value)),f=(p+1)/2;
+  return [Math.round(205-142*f),Math.round(113+98*f),Math.round(174-13*f),.08+.24*Math.abs(p)];
+}
 
 export function visualConfig(scene={}, overrides={}) {
   const source={...(scene.config_snapshot||{}),...overrides}, result={...VISUAL_DEFAULTS};

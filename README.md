@@ -4,7 +4,11 @@
 
 详细算法、等式约束、初始化和接口见[设计文档](docs/superpowers/specs/2026-11-27-maritime-imitation-design.md)，实施步骤和问题修复见[实施方案](docs/superpowers/plans/2026-11-27-maritime-imitation-implementation.md)。
 
-当前跟踪网络已在17个独立1800秒回合保持目标全程可见。最终专家固定64案例全部通过：54个覆盖案例各10800秒安全达到100%首扫，10个跟踪案例各1800秒全程可见，0初始剔除。覆盖网络仍处于实验阶段，现有小批量BC/DAgger权重尚不能稳定完成闭环覆盖，不能仅凭验证损失下降判为达标。具体实验结果见[验证状态](docs/validation-status.md)。
+本分支 `feat/local-potential-field` 在 `c56e40c` 上增加局部引斥场。新接口、指数曲线、优化评分与实现步骤见[局部场设计](docs/superpowers/specs/2026-11-27-local-potential-field-design.md)及[实施计划](docs/superpowers/plans/2026-11-27-local-potential-field.md)。`run.sh` 默认启用 field-v2，独立输出到 `outputs/field-v2`、`tf-logs/field-v2`；旧 v1 数据和权重保持独立。
+
+新场值为：刚扫描 −1、按归一化指数在信息价值失效周期 T 恢复至 +1；从未扫描 +1；ROI 外 −1；雷云及安全膨胀区固定 −2。覆盖正引力只在当前子任务 ROI 的海水格中存在，数值和绘图均遵守边界。只生成 UAV 周围半径内的33×33场，历史仅存扫描时间戳；T 控制信息老化，不是重访期限。两个任务分别使用带运动几何参考的残差 CNN+GRU 模型，共同输入 `vector + potential + field_context`，输出世界 XY 单位速度方向与归一化雷达 pan；恒速、有限滚转与雷达转速仍由环境执行。侧视/前视保留各自安装方向。前端“局部引斥场”开关与 MP4 使用同一固定色标。
+
+field-v2 专家当前24/24固定场景通过，0排除、0失败：16例覆盖各10800秒全部达到100%，8例跟踪各1800秒全程可见。跟踪网络在6个验证回合和4个新的独立1800秒测试回合均全程可见；覆盖网络尚在闭环修复中。新版本的验收范围、失败证据与本地路径见[局部场验证记录](docs/local-potential-field-validation.md)。旧 v1 的64例专家、17例跟踪网络及覆盖网络局限见[原验证状态](docs/validation-status.md)，这些旧数字不计入 field-v2。
 
 ## 安装与运行
 
@@ -31,6 +35,7 @@ bash run.sh collect                        # 各自采集；失败轨迹不进�
 bash run.sh train                          # 根据成功清单分别训练
 bash run.sh evaluate                       # 从已保存专家场景恢复，再运行两网络
 bash run.sh serve                          # 只启动历史回放界面
+bash run.sh expert --no-potential-field --output-dir outputs/legacy-check  # 显式使用保留的 v1 专家
 bash run.sh train --task tracking          # 单任务单独训练
 bash run.sh dagger --task coverage --dagger-beta 0.8 --run-name coverage-dagger-1
 # 继续训练时可用 --warm-start --checkpoint-path ...；只补采用 --dagger-collect-only
@@ -39,7 +44,7 @@ bash run.sh dagger --task coverage --dagger-beta 0.8 --run-name coverage-dagger-
 默认界面为[http://127.0.0.1:8787](http://127.0.0.1:8787)，任务完成后保持服务直到Ctrl+C。自动运行可加`--no-open-browser --no-keep-server`；不需要端口界面时加`--no-visualize`。独立回放也可直接：
 
 ```bash
-python main.py --mode serve --output-dir outputs --tf-log-dir tf-logs --port 8787
+python main.py --mode serve --potential-field --output-dir outputs/field-v2 --tf-log-dir tf-logs/field-v2 --port 8787
 tensorboard --logdir tf-logs --port 6006
 ```
 
@@ -54,12 +59,12 @@ tensorboard --logdir tf-logs --port 6006
 | src/ | 物理、环境、专家、两网络、采集、训练与服务源码 |
 | visual/ | 原生JS海图、实时SSE、历史回放 |
 | figs/ | 下载的彩虹CH-4、科考船、海洋照片；加载式二维SVG模型及来源许可 |
-| outputs/datasets/{coverage,tracking}/ | 完整JSON示范、派生NPZ、权威accepted-manifest |
-| outputs/models/{coverage,tracking}/ | best.pt、last.pt、任务名导出模型、场景划分和训练历史 |
-| outputs/replays/ | 同场景专家/网络JSON，前端可直接回放 |
-| outputs/videos/ | H.264 MP4及最终帧PNG |
-| outputs/training/、outputs/reports/ | 训练报告和阶段报告 |
-| outputs/validation-report.json | 两任务专家、训练、网络闭环的合并实际结果 |
+| outputs/field-v2/datasets/{coverage,tracking}/ | 默认采集的完整JSON、派生NPZ、accepted-manifest |
+| outputs/field-v2/models/{coverage,tracking}/ | best.pt、last.pt、通过闭环选择后的 selected.pt |
+| outputs/field-v2/{coverage,tracking}-experiment/ | 本地实跑数据、分组划分、候选权重、失败及测试回放 |
+| outputs/field-v2/replays/、outputs/field-v2/final-demo-current/ | 专家/网络JSON、H.264 MP4与PNG |
+| outputs/field-v2/training/、outputs/field-v2/reports/ | 训练报告和阶段报告 |
+| outputs/field-v2/validation-report.json | 默认入口的两任务合并结果 |
 | outputs/diagnostics/、outputs/cache/ | 诊断记录与缓存 |
 | tf-logs/ | 分任务/分实验的TensorBoard事件文件 |
 
@@ -69,11 +74,13 @@ JSON训练数组使用可无损解码的zlib+base64，不依赖NPZ才能恢复�
 
 雷达始终按真实3km绘制。图标按参考长宽缩放，同时保留最小像素以便辨认；因此全域视角的图标是有最小可见尺寸的符号，并非严格等比例的实机轮廓。`SIM_CONFIG`中的16个`visual_*`参数可控制网格、渐淡、尾迹、参考尺寸、最小像素及默认开关。服务通过`/api/visual-config`把当前入口的显示参数提供给旧回放，不改变其物理数据。
 
-两模型不共享参数。原始动作是二维期望世界速度方向；真实机船位置由有限倾斜/舵机响应模型推进，不能直接跳点。图片/二维模型只影响显示，按真实速度旋转。
+两模型不共享参数。field-v2 动作为二维期望世界速度方向加雷达 pan 指令，v1 保留原二维动作；真实机船位置由有限倾斜/舵机响应模型推进，不能直接跳点。图片/二维模型只影响显示，按真实速度旋转。
 
 ## 训练指标与检查
 
-仅记录确定性连续策略适用的6条曲线：Train/Validation的Loss、Action_MSE、Action_MAE。默认Loss是每步XY平方误差和，MSE是每分量均方误差；可选纠正权重启用时Train/Loss记录实际加权目标，MSE/MAE与Validation始终不加权；不虚构离散准确率或概率分布指标。验证集按完整场景划分，同一场景的相邻时间片不会泄漏。
+仅记录确定性连续策略适用的6条曲线：Train/Validation的Loss、Action_MSE、Action_MAE。field-v2 的Loss是每步三个动作分量的平方误差和，MSE为逐分量均值；可选纠正权重启用时Train/Loss记录实际加权目标，MSE/MAE与Validation始终不加权；不虚构离散准确率或概率分布指标。验证集按完整场景划分，同一场景的相邻时间片不会泄漏。`best.pt` 按验证损失保存，部署 `selected.pt` 只按验证场景闭环结果生成；测试场景不参与选择。
+
+`run.sh`还显式设置`--dagger-recovery-min-steps 7200`：短DAgger失败前缀按完整回合重复采样，每次重置GRU，不能拼接成虚构连续轨迹。原始场景划分、归一化和验证不重复；checkpoint记录采样预算及各回合实际曝光。设为0可关闭。无验证集时，重复采样模型按唯一训练回合的独立推理误差选取，避免与第0轮比较不同分布。
 
 ```bash
 python -m pytest -q
