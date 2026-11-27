@@ -16,6 +16,18 @@ field-v2 专家当前24/24固定场景通过，0排除、0失败：16例覆盖�
 
 `--policy-safety-layer forecast` 为默认关闭、仅供field-v2显式评估的物理预测约束原型；安全时透传网络动作，冲突时公开记录几何修正。回放分别保存原始、约束后和实际动作，并标记“显式物理约束”。它不调用任务专家，使用同一观测及既有动力学；有限时域预测不构成全局安全证明，也不能代替纯网络验收。
 
+该显式约束版本在冻结权重/代码后通过27个已知3h回归及4个新3h场景32300–32303，全部安全且100%首扫。已知场景5例共12次干预；新场景32302另有12次干预，其余3例为0。原始覆盖网络仍拒绝发布；可选系统与纯模型分别记录在本地 `deployment-artifacts.json` 的 `guarded_systems` 与 `models`。完整286项测试通过，实际main/SSE/历史/四部MP4均独立审计，详细证据见验证记录。
+
+本地可选覆盖系统权重与完整配置在 `outputs/field-v2/systems/coverage-forecast/`；已有演示在 `outputs/field-v2/final-demo-forecast-constraint/`，回放界面为 `http://127.0.0.1:8791/`。显式启用示例（8792避免占用已有演示）：
+
+```bash
+bash run.sh evaluate --task coverage --policy-safety-layer forecast \
+  --checkpoint-path outputs/field-v2/systems/coverage-forecast/coverage_policy.pt \
+  --output-dir outputs/field-v2/guarded-runs --tf-log-dir tf-logs/field-v2 --port 8792
+```
+
+上述本地权重、数据、影片和TF日志按.gitignore排除；源代码及配置入口在Git分支中，克隆代码不会自动获得这些本地产物。
+
 ## 安装与运行
 
 新训练默认采用任务分别配置的云编码（`--field-cloud-geometry-encoder auto`）：覆盖使用共享几何编码，跟踪保留slots。已保存模型、warm-start和DAgger始终继承checkpoint实际架构。跨架构fresh重训可用 `--split-reference-checkpoint` 固定历史场景划分，权重和归一化重新初始化。

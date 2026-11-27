@@ -73,7 +73,9 @@ T 是信息价值失效周期：刚扫描 P=-1，按归一化指数恢复，在 
 
 进一步实现默认关闭的显式预测约束原型，限 `evaluate --policy-safety-layer forecast`，纯网络仍为默认。该组件单独标记启发式几何干预，记录原始/约束后/实际动作；不修改场、物理或原模型，也不调用任务专家。它只能作为独立系统评估，不能据此把上述纯模型改标为通过；完整方案及有限时域局限见局部场设计。
 
-已知32201诊断在该模式下完成10800s、100%首扫及100%复扫，仅两次修改XY，雷达命令逐位保留。冻结权重821和约束代码后，已预声明27个已知回归及新32300–32303；成果在 `outputs/field-v2/forecast-constraint-prototype/`，未完成之前不能称系统通过。`constraint-layer-integration-review.md/json` 审查覆盖缺失/过期缓存标签修复与动作记录一致性。
+已知32201诊断在该模式下完成10800s、100%首扫及100%复扫，仅两次修改XY，雷达命令逐位保留。冻结权重821和约束代码后，预声明27个已知回归及新32300–32303，实际均通过：每场10800s、无碰撞越界、100%首扫。27已知场景首次完整3529.1–9727.3s，复扫最低96.27%，5例共12次干预、单场最多5次；这27例不是新独立测试。4个新场景几何与训练/VAL/已知组独立，首次完整分别5018.1、8482.9、5676.2、5504.5s，复扫99.95%、98.49%、99.97%、100%；32302有12次修正，其余三例为0。没有执行对应纯网络反事实，不能据此推断每次干预均避免了必然碰撞。
+
+证据为 `outputs/field-v2/forecast-constraint-prototype/{frozen-protocol,known-report,fresh-report}.json`。`constraint-layer-integration-review.md/json` 独立复核实现、缺失/过期缓存标签及动作记录；`independent-acceptance-audit.md/json` 单独审查冻结协议及完整原始文件。此结果只接受明确标记的有限场景约束系统，不能解除纯821网络拒绝或证明任意初始化/无限运行安全。可选系统产物在 `outputs/field-v2/systems/coverage-forecast/`，全局清单单列 `guarded_systems.coverage`，纯覆盖 `models.coverage` 仍不存在。
 
 当前扩大训练使用原8条专家轨迹、6条学生访问状态的DAgger前缀与新增20条有效专家轨迹，共34条唯一轨迹、28个几何场景组；32训练回合属于26组，原2验证组保持独立。新增采集保存19条旧初始化源码数据与1条修正后重采样数据，逐回合记录真实源码指纹；原不可行起点的失败和拒绝证据同时保留。不得将混合来源数据重新标为全部来自同一源码，也不将2h结束但未100%首扫的安全前缀描述为完整覆盖成功。
 
@@ -88,6 +90,12 @@ T 是信息价值失效周期：刚扫描 P=-1，按归一化指数恢复，在 
 默认全部参数在 `run.sh`，输出目录与TF目录均通过CLI传入。`bash run.sh expert`、`collect`、`train`、`dagger`、`evaluate`、`serve` 对应独立阶段。Windows可设置 `PYTHON=D:/miniconda/python.exe` 后用Git Bash调用。
 
 已归档同场景演示目录为 `outputs/field-v2/final-demo-initial-safety/`。两条专家影片及跟踪网络影片均为240帧、24fps、1440×900，按真实时间戳倍速抽帧；失败覆盖影片只有38帧，如实展示37秒碰撞。新目录 `final-demo-shared-cloud/` 已准备两部720帧、24fps、1440×900的专家影片和桌面/手机回放检查；由于共享覆盖候选未通过新独立测试，没有把这些专家影片或旧服务尾帧冒充新网络的最终演示。播放速度不改变运动学；不得将短失败影片算作3h覆盖完成。
+
+本次实际主程序演示另存 `outputs/field-v2/final-demo-forecast-constraint/`，端口8791。Coverage7100使用显式约束模式、权重821；实际0干预，10800s首扫4472.3s、覆盖及复扫100%。Tracking7101使用原纯网络43，1800s全程可见。这两个初始化是已知/TRAIN演示，独立新测试计数为0；专家JSON/sidecar/MP4从冻结目录按字节复制，不计新的专家成功例。
+
+四部H264影片均720帧、24fps、30s、1440×900，全部2880帧独立解码，24截图及两组对照图目视通过。按四份完整动作重积分252000个0.1s子步，实体误差0，无云/岛屿/world碰撞；另用独立hypot+atan2扇形公式对两条覆盖轨迹初态及每子步重算扫描，共216002次、884744192个格点判定，与保存年龄和指标一致。4103899个正场样本全部位于ROI海水，无硬云覆盖错误。证据为同目录 `final-demo-verification.json`、`final-demo-report.md`、`network-video-qa/`。
+
+真实浏览器收到2160个覆盖SSE帧与360个跟踪SSE帧，时间严格递增、位置变化；覆盖标签带显式物理约束，跟踪恢复纯网络标签。四条历史回放、播放/暂停/重启/跳转、图层开关和390px手机均通过；现场正色像素48446个在ROI内、0在外。两主程序交接期间3条短暂ERR_CONNECTION_REFUSED已自动恢复，页面脚本异常0；不能写成控制台绝对无错误。证据为 `browser-qa/report.md/json`。8791保留回放服务，原8787/8788/8789未停止。
 
 界面可用 `bash run.sh serve --port 8789 --no-open-browser`，历史列表递归发现field-v2目录里的专家、网络和明确标记的DAgger回放。TF可用 `tensorboard --logdir tf-logs/field-v2 --port 6006`。标准部署权重整理到 `outputs/field-v2/models/{task}/selected.pt`，实际来源和SHA记在 `outputs/field-v2/deployment-artifacts.json`。
 
