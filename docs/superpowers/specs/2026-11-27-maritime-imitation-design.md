@@ -197,6 +197,8 @@ reset检查完整参考路线几何、边界和间距；已有强制绕岛的真
 
 均值/标准差只由训练场景拟合；精确常量std=1，非恒定小std默认下限0.1，避免合法操纵状态被放大几十倍。实际闭环表明这种放大会导致短训练分布之外的跟踪漂移。预处理/下限/结构随checkpoint保存。
 
+新增可选mask_previous_command：仅在覆盖模型内部预处理将vector[8:10]置零，原始共同观测和动作协议不变，bank/yaw物理状态仍保留。该消融针对已观察到的“复制上一命令”捷径，不是性能保证。CLI为--coverage-mask-previous-command，默认关闭；fresh训练使用当前开关，warm/DAgger继承checkpoint设置并打印。旧checkpoint缺字段按False，训练归一化、前向与在线部署共用同一预处理，tracking模型不增加此字段。
+
 ## 10. 独立采集、JSON和验证划分
 
 main按task单独创建环境/专家。run_episode只复用交互代码。保存obs_0，随后obs_t→a_t→obs_(t+1)，T+1观测对应T动作；地图和状态是独立快照。

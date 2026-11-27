@@ -184,6 +184,7 @@ exec "$PYTHON" main.py \
   --hidden-size 128 --heading-residual --action-frame body --feature-frame auto --normalize-vectors --normalization-min-std 0.1 \
   --correction-weight-max 1 --correction-threshold 0.1 \
   --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
+  --no-coverage-mask-previous-command \
   --device auto --inference-device cpu --num-threads 1 \
   --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-max-steps 0 --no-dagger-collect-only \
   --validation-coverage-seeds 2000 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 3014 3015 3016 3017 3018 3019 3020 3021 3022 3023 3024 3025 3026 3027 3028 \

@@ -63,6 +63,8 @@ def parser():
                    help='Add observed aircraft position/heading channels inside the coverage CNN')
     p.add_argument('--coverage-ego-map-sigma',type=float,default=2.,help='Aircraft Gaussian width in map cells')
     p.add_argument('--coverage-ego-map-mode',choices=['gaussian','body_coordinates','world_coordinates'],default='gaussian')
+    p.add_argument('--coverage-mask-previous-command',action=argparse.BooleanOptionalAction,default=False,
+                   help='Fresh coverage training: mask vector[8:10] inside the model; warm-start/DAgger inherit checkpoint setting (old checkpoints: false)')
     p.add_argument('--dataset-manifest',type=Path,default=None)
     p.add_argument('--dagger-episodes',type=int,default=4)
     p.add_argument('--dagger-iteration',type=int,default=1)
@@ -223,7 +225,8 @@ def main(argv=None):
                 if task=='coverage' and initial_checkpoint is None and args.mode!='dagger':
                     model_config.update(ego_map_channels=args.coverage_ego_map,
                                         ego_map_sigma=args.coverage_ego_map_sigma,
-                                        ego_map_mode=args.coverage_ego_map_mode)
+                                        ego_map_mode=args.coverage_ego_map_mode,
+                                        mask_previous_command=args.coverage_mask_previous_command)
                 if args.mode=='dagger':
                     from collect_dagger import collect_dagger
                     import torch
@@ -252,6 +255,9 @@ def main(argv=None):
                             ego_map_mode=args.coverage_ego_map_mode)
                         saved=torch.load(initial_checkpoint,map_location='cpu',weights_only=False)
                     model_config=saved['model_config']
+                    if task=='coverage':
+                        print(f"[coverage] mask_previous_command={model_config.get('mask_previous_command',False)} "
+                              "inherited from checkpoint (fresh-training flag is not applied)",flush=True)
                 training=train_policy(task,manifest_path if manifest_path.exists() else dataset_dir,
                     out/'models'/task,args.tf_log_dir/task/args.run_name,
                     epochs=args.epochs,batch_size=args.batch_size,sequence_length=args.sequence_length,

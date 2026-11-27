@@ -4,7 +4,7 @@
 
 详细算法、等式约束、初始化和接口见[设计文档](docs/superpowers/specs/2026-11-27-maritime-imitation-design.md)，实施步骤和问题修复见[实施方案](docs/superpowers/plans/2026-11-27-maritime-imitation-implementation.md)。
 
-当前跟踪网络已在7个独立1800秒回合保持目标全程可见。覆盖专家能完成持续扫描；覆盖网络仍处于实验阶段，现有小批量BC/DAgger权重尚不能稳定完成闭环覆盖，不能仅凭验证损失下降判为达标。具体实验结果见[验证状态](docs/validation-status.md)。
+当前跟踪网络已在17个独立1800秒回合保持目标全程可见。最终专家固定64案例全部通过：54个覆盖案例各10800秒安全达到100%首扫，10个跟踪案例各1800秒全程可见，0初始剔除。覆盖网络仍处于实验阶段，现有小批量BC/DAgger权重尚不能稳定完成闭环覆盖，不能仅凭验证损失下降判为达标。具体实验结果见[验证状态](docs/validation-status.md)。
 
 ## 安装与运行
 
@@ -44,6 +44,8 @@ tensorboard --logdir tf-logs --port 6006
 ```
 
 入口参数帮助：`python main.py --help`。仿真/专家全部参数位于`run.sh`的`SIM_CONFIG`，通过`--config-json`整体传入Python；不是隐藏在另一份配置文件中。
+
+覆盖模型可用 `--coverage-mask-previous-command` 做独立消融：仅在模型内部预处理将上一拍命令 `vector[8:10]` 置零，原始共同观测和世界XY单位方向动作接口保持不变，tracking不受影响。`run.sh`显式默认 `--no-coverage-mask-previous-command`；旧checkpoint缺少 `model_config.mask_previous_command` 时按False解释，保留原行为。此开关只决定fresh覆盖训练的架构；warm-start与DAgger明确继承checkpoint配置，不用该fresh开关重解释旧权重。要启用该消融，应从零训练，或继续训练已保存True标志的模型。该选项本身不代表覆盖闭环已经达标。
 
 ## 产物
 

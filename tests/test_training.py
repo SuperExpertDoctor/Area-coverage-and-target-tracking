@@ -304,6 +304,97 @@ def test_coverage_ego_mode_rejects_unknown_coordinate_encoding():
         module("train").create_policy("coverage", {"ego_map_mode": "unsupported"})
 
 
+@pytest.mark.parametrize("frame", ["world", "body"])
+@pytest.mark.parametrize("ego_map", [False, True])
+def test_optional_coverage_command_mask_removes_only_command_features(frame, ego_map):
+    train = module("train")
+    config = dict(feature_frame=frame, action_frame=frame, ego_map_channels=ego_map,
+                  mask_previous_command=True, ego_map_mode="world_coordinates")
+    model = train.create_policy("coverage", config)
+    baseline = train.create_policy("coverage", {**config, "mask_previous_command": False})
+    vector = torch.randn(2, 4, 111)
+    vector[..., 2:4] = torch.tensor([.6, .8])
+    vector[..., 94:98] = torch.tensor([-.2, .3, -.4, .6])
+    original = vector.clone()
+    transformed = model.preprocess_vector(vector)
+    expected = baseline.preprocess_vector(vector).clone()
+    expected[..., 8:10] = 0
+    torch.testing.assert_close(transformed, expected)
+    torch.testing.assert_close(transformed[..., 6:8], vector[..., 6:8])
+    torch.testing.assert_close(vector, original)
+    obs = dict(vector=vector, coverage_map=torch.rand(2, 4, 3, 64, 64))
+    different = vector.clone()
+    different[..., 8:10] = torch.tensor([0., -1.])
+    first, hidden1 = model(obs)
+    second, hidden2 = model({**obs, "vector": different})
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    torch.testing.assert_close(hidden1, hidden2, rtol=0, atol=0)
+    assert model.model_config["mask_previous_command"] is True
+    assert "mask_previous_command" not in train.create_policy("tracking").model_config
+
+
+def test_masked_coverage_checkpoint_roundtrip_and_legacy_default(tmp_path):
+    train = module("train")
+    policy_module = module("policy_tracking")
+    for masked in [False, True]:
+        model = train.create_policy("coverage", {"mask_previous_command": masked})
+        config = dict(model.model_config)
+        if not masked:
+            config.pop("mask_previous_command")  # checkpoints predating this option
+        path = tmp_path / f"masked-{masked}.pt"
+        torch.save(dict(checkpoint_version="bc-v1", observation_schema="obs-v1", task="coverage",
+                        model_config=config, model_state_dict=model.state_dict()), path)
+        loaded = policy_module.NeuralPolicy.from_checkpoint(path)
+        direct = policy_module.NeuralPolicy(model)
+        assert loaded.model.mask_previous_command is masked
+        obs = {"vector": np.zeros(111, np.float32), "coverage_map": np.zeros((3, 64, 64), np.float32)}
+        obs["vector"][2:4] = [.6, .8]
+        obs["vector"][8:10] = [-1., 0.]
+        for _ in range(3):
+            np.testing.assert_allclose(loaded.act(obs), direct.act(obs), atol=1e-7)
+
+
+def test_cli_command_mask_is_explicit_and_fresh_training_receives_it(tmp_path, monkeypatch):
+    import main
+    import sys
+    assert main.parser().parse_args([]).coverage_mask_previous_command is False
+    assert main.parser().parse_args(["--coverage-mask-previous-command"]).coverage_mask_previous_command is True
+    assert main.parser().parse_args(["--no-coverage-mask-previous-command"]).coverage_mask_previous_command is False
+    def capture(task, *args, **kwargs):
+        assert task == "coverage" and kwargs["model_config"]["mask_previous_command"] is True
+        assert kwargs["initial_checkpoint"] is None
+        raise RuntimeError("captured fresh model config")
+    monkeypatch.setattr(module("train"), "train_policy", capture)
+    previous_cache = sys.pycache_prefix
+    try:
+        with pytest.raises(RuntimeError, match="captured fresh model config"):
+            main.main(["--mode", "train", "--task", "coverage", "--output-dir", str(tmp_path),
+                       "--device", "cpu", "--coverage-mask-previous-command", "--no-visualize"])
+    finally:
+        sys.pycache_prefix = previous_cache
+
+
+def test_cli_warm_start_explicitly_inherits_legacy_command_features(tmp_path, monkeypatch, capsys):
+    import main
+    import sys
+    checkpoint = tmp_path / "old.pt"
+    torch.save({"model_config": {}}, checkpoint)
+    def capture(task, *args, **kwargs):
+        assert kwargs["model_config"].get("mask_previous_command", False) is False
+        assert kwargs["initial_checkpoint"] == checkpoint
+        raise RuntimeError("captured inherited config")
+    monkeypatch.setattr(module("train"), "train_policy", capture)
+    previous_cache = sys.pycache_prefix
+    try:
+        with pytest.raises(RuntimeError, match="captured inherited config"):
+            main.main(["--mode", "train", "--task", "coverage", "--output-dir", str(tmp_path),
+                       "--device", "cpu", "--no-visualize", "--warm-start",
+                       "--checkpoint-path", str(checkpoint), "--coverage-mask-previous-command"])
+    finally:
+        sys.pycache_prefix = previous_cache
+    assert "mask_previous_command=False inherited from checkpoint" in capsys.readouterr().out
+
+
 def test_scene_groups_never_leak_and_dataset_uses_command_labels(tmp_path):
     datasets = module("datasets")
     for index, scene in enumerate(["repeat", "repeat", "b", "c", "d"]):

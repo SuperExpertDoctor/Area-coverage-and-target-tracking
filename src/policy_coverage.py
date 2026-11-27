@@ -18,7 +18,7 @@ class CoveragePolicy(_DirectionalRecurrentPolicy):
 
     def __init__(self, vector_dim=111, hidden_size=128, heading_residual=True,
                  action_frame="body", feature_frame="body", ego_map_channels=False,
-                 ego_map_sigma=2., ego_map_mode="gaussian"):
+                 ego_map_sigma=2., ego_map_mode="gaussian", mask_previous_command=False):
         super().__init__(vector_dim, hidden_size, heading_residual, action_frame, feature_frame)
         if ego_map_mode not in {"gaussian", "body_coordinates", "world_coordinates"}:
             raise ValueError("ego_map_mode must be gaussian, body_coordinates or world_coordinates")
@@ -29,8 +29,9 @@ class CoveragePolicy(_DirectionalRecurrentPolicy):
         self.ego_map_channels = bool(ego_map_channels)
         self.ego_map_sigma = float(ego_map_sigma)
         self.ego_map_mode = ego_map_mode
+        self.mask_previous_command = bool(mask_previous_command)
         self.model_config.update(ego_map_channels=self.ego_map_channels, ego_map_sigma=self.ego_map_sigma,
-                                 ego_map_mode=self.ego_map_mode)
+                                 ego_map_mode=self.ego_map_mode, mask_previous_command=self.mask_previous_command)
         # Nonpersistent coordinate buffers preserve old checkpoint compatibility.
         centers = torch.arange(64, dtype=torch.float32) + .5
         self.register_buffer("_grid_x", centers.view(1, 1, 1, 64), persistent=False)
@@ -50,6 +51,12 @@ class CoveragePolicy(_DirectionalRecurrentPolicy):
             # islands, while the numerical sea mask already represents target land.
             result[..., :2] = 0
             result[..., 54:94] = 0
+        if self.mask_previous_command:
+            # Coverage-only ablation: keep the shared raw observation intact,
+            # but force planning to use geometry/physical state and GRU history
+            # rather than copying the teacher's preceding commanded direction.
+            result = result.clone()
+            result[..., 8:10] = 0
         return result
 
     def build_ego_channels(self, obs_sequence):
