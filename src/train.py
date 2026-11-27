@@ -5,7 +5,8 @@ batch_size=32, sequence_length=32, learning_rate=3e-4, weight_decay=1e-5,
 grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128, device='cpu',
 num_threads=1, model_config=None, metadata=None, normalize_vectors=True,
 normalization_min_std=.1, initial_checkpoint=None,
-correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0)``
+correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
+split_reference_checkpoint=None)``
 
 An episode begins with zero hidden state. Its contiguous TBPTT chunks carry
 ``hidden.detach()``. Episodes, never individual fragments, are shuffled. Loss is
@@ -263,7 +264,8 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                  grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128,
                  device="cpu", num_threads=1, model_config=None, metadata=None,
                  normalize_vectors=True, normalization_min_std=.1, initial_checkpoint=None,
-                 correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0):
+                 correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
+                 split_reference_checkpoint=None):
     """Train one task, write six meaningful TensorBoard metrics and best/last files.
 
     ``model_config`` accepts ``vector_dim``, ``hidden_size`` and
@@ -292,6 +294,11 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     Historical scene groups keep their original subset regardless of a new seed
     or validation fraction; only new groups are split. The exact input checkpoint
     is saved once under initial-checkpoints/<sha256>.pt before output replacement.
+    split_reference_checkpoint applies only its historical scene assignments to
+    a fresh architecture; it never loads weights or normalization. Its task and
+    public protocol must agree. With validation_fraction=0 all new groups become
+    training groups while historical validation stays fixed. The source SHA256
+    and a split-only JSON snapshot are saved for reproducibility.
     During optimizer updates only, a valid step has weight correction_weight_max
     when norm(expert_action - raw_vector[8:10]) > correction_threshold, otherwise
     weight 1. Loss is the weighted squared XY vector distance divided by valid
@@ -379,12 +386,38 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     field_mode = bool(options.get("potential_field", False))
     observation_schema = FIELD_OBSERVATION_SCHEMA if field_mode else "obs-v1"
     action_schema = FIELD_ACTION_SCHEMA if field_mode else "action-v1"
-    split = split_episodes(dataset_dir, task, validation_fraction=0 if initial_state is not None else validation_fraction,
+    reference_split = None
+    reference_path = reference_sha256 = reference_snapshot = None
+    if split_reference_checkpoint is not None:
+        if initial_state is not None:
+            raise ValueError("split reference is for fresh training; warm-start already preserves its own split")
+        reference_path = Path(split_reference_checkpoint).resolve()
+        reference_bytes = reference_path.read_bytes()
+        reference_sha256 = hashlib.sha256(reference_bytes).hexdigest()
+        reference = torch.load(io.BytesIO(reference_bytes), map_location="cpu", weights_only=False)
+        expected_version = "bc-field-v2" if field_mode else "bc-v1"
+        if (reference.get("task") != task or reference.get("checkpoint_version") != expected_version or
+                reference.get("observation_schema") != observation_schema):
+            raise ValueError("split reference task or observation protocol does not match fresh training")
+        if field_mode and reference.get("action_schema") != FIELD_ACTION_SCHEMA:
+            raise ValueError("split reference action protocol does not match field training")
+        reference_split = reference.get("dataset_split")
+        if not isinstance(reference_split, dict) or not reference_split.get("train_paths"):
+            raise ValueError("split reference requires complete historical scene assignments")
+        reference_snapshot = output_dir / "split-references" / f"{reference_sha256}.json"
+        reference_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(reference_snapshot, dict(checkpoint=str(reference_path), sha256=reference_sha256,
+                                            dataset_split=reference_split))
+    split = split_episodes(dataset_dir, task, validation_fraction=0 if initial_state is not None or reference_split is not None else validation_fraction,
                            seed=seed, observation_schema=observation_schema)
     if initial_state is not None:
         if not 0 <= validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0,1)")
         split = _preserve_scene_assignments(split, initial_state.get("dataset_split"), validation_fraction, seed)
+    elif reference_split is not None:
+        if not 0 <= validation_fraction < 1:
+            raise ValueError("validation_fraction must be in [0,1)")
+        split = _preserve_scene_assignments(split, reference_split, validation_fraction, seed)
     train_dataset = SequenceDataset(split["train_paths"], task=task, observation_schema=observation_schema)
     validation_dataset = SequenceDataset(split["validation_paths"], task=task, observation_schema=observation_schema)
     training_order, sampling_report = _training_sample_order(train_dataset, dagger_recovery_min_steps)
@@ -414,6 +447,9 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     train_config["initial_checkpoint"] = None if initial_path is None else str(initial_path)
     train_config["initial_checkpoint_sha256"] = initial_sha256
     train_config["initial_checkpoint_requested"] = None if initial_requested_path is None else str(initial_requested_path)
+    train_config["split_reference_checkpoint"] = None if reference_path is None else str(reference_path)
+    train_config["split_reference_checkpoint_sha256"] = reference_sha256
+    train_config["split_reference_snapshot"] = None if reference_snapshot is None else str(reference_snapshot.resolve())
     train_config["correction_weight_max"] = float(correction_weight_max)
     train_config["correction_threshold"] = float(correction_threshold)
     train_config["dagger_recovery_min_steps"] = int(dagger_recovery_min_steps)

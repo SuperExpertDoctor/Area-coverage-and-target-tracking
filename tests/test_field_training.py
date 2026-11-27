@@ -1,6 +1,7 @@
 """Field-v2 protocol isolation, causal imitation and deployable checkpoints."""
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -318,3 +319,94 @@ def test_tracking_orbit_reference_preserves_fixed_speed_and_uses_observed_target
     adjusted, _ = model(obs)
     assert adjusted[0, 0, 0] > .7
     torch.testing.assert_close(adjusted[..., :2].norm(dim=-1), torch.ones(1, 1))
+
+
+@pytest.mark.parametrize('task', ['coverage','tracking'])
+def test_shared_cloud_geometry_is_permutation_invariant_causal_and_learns(task):
+    torch.manual_seed(121)
+    model=train.create_policy(task, {'potential_field':True,'field_frame':'body',
+                                    'cloud_geometry_encoder':'shared_pool_v1','hidden_size':32})
+    obs=observation(task,1,5)
+    slots=obs['vector'][...,14:54].reshape(1,5,8,5)
+    slots[...,4]=0
+    slots[...,0,0:4]=torch.tensor([1.,.4,.2,.8]);slots[...,0,4]=1
+    slots[...,3,0:4]=torch.tensor([-.2,1.4,.3,1.1]);slots[...,3,4]=1
+    original={key:value.clone() for key,value in obs.items()}
+    action,memory=model(obs)
+    permutation=torch.tensor([7,3,5,1,6,0,4,2])
+    shuffled={**obs,'vector':obs['vector'].clone()}
+    shuffled['vector'][...,14:54]=slots[...,permutation,:].reshape(1,5,40)
+    shuffled_action,shuffled_memory=model(shuffled)
+    torch.testing.assert_close(action,shuffled_action,atol=1e-6,rtol=1e-6)
+    torch.testing.assert_close(memory,shuffled_memory,atol=1e-6,rtol=1e-6)
+    assert torch.count_nonzero(model.preprocess_vector(obs['vector'])[...,14:54])==0
+    first,hidden=model({key:value[:,:2] for key,value in obs.items()})
+    rest,hidden=model({key:value[:,2:] for key,value in obs.items()},hidden)
+    torch.testing.assert_close(torch.cat([first,rest],1),action)
+    torch.testing.assert_close(hidden,memory)
+    (action-torch.tensor([0.,1.,.7])).square().mean().backward()
+    assert model.cloud_encoder[0].weight.grad.abs().sum()>0
+    empty={**obs,'vector':obs['vector'].clone()}
+    empty['vector'][...,14:54].reshape(1,5,8,5)[...,4]=0
+    torch.testing.assert_close(model.encode_clouds(empty),torch.zeros(1,5,64),atol=0,rtol=0)
+    assert torch.isfinite(model(empty)[0]).all()
+    assert not torch.allclose(model.encode_clouds(obs),model.encode_clouds(empty))
+    for key in obs:torch.testing.assert_close(obs[key],original[key],atol=0,rtol=0)
+
+
+@pytest.mark.parametrize('task,margin_index',[('coverage',109),('tracking',128)])
+def test_shared_cloud_coordinates_use_observed_heading_and_hard_margin(task,margin_index):
+    model=train.create_policy(task,{'potential_field':True,'cloud_geometry_encoder':'shared_pool_v1'})
+    obs=observation(task,1,1);obs['vector'].zero_()
+    obs['vector'][...,3]=1  # physical north-facing heading
+    obs['vector'][...,margin_index]=200/3000
+    obs['vector'][...,14:19]=torch.tensor([0.,1.,.2,.8,1.])
+    expected=torch.tensor([1.,0.,.2+200/3000,.8-200/3000])
+    torch.testing.assert_close(model.cloud_geometry(obs)[0,0,0],expected)
+    obs['vector'][...,margin_index]=400/3000
+    changed=model.cloud_geometry(obs)[0,0,0]
+    assert changed[2]>expected[2] and changed[3]<expected[3]
+
+
+def test_missing_cloud_option_preserves_legacy_field_weights_and_outputs(tmp_path):
+    torch.manual_seed(81)
+    legacy=train.create_policy('coverage',{'potential_field':True,'field_frame':'body'})
+    old_config={key:value for key,value in legacy.model_config.items() if key!='cloud_geometry_encoder'}
+    path=tmp_path/'old-field.pt'
+    torch.save(dict(checkpoint_version='bc-field-v2',observation_schema='obs-field-v2',
+        action_schema='action-field-v2',task='coverage',model_config=old_config,
+        model_state_dict=legacy.state_dict()),path)
+    loaded=load_policy(path).model
+    assert loaded.model_config['cloud_geometry_encoder']=='slots'
+    obs=observation('coverage',1,3)
+    torch.testing.assert_close(legacy(obs)[0],loaded(obs)[0],atol=0,rtol=0)
+    assert set(legacy.state_dict())==set(loaded.state_dict())
+
+
+def test_fresh_cloud_architecture_pins_historical_validation_without_warm_weights(tmp_path):
+    import hashlib
+    folder=tmp_path/'data';folder.mkdir()
+    for index in range(3):episode(folder/f'{index}.npz',scene=f'old-{index}')
+    old=train.train_policy('coverage',folder,tmp_path/'old',tmp_path/'old-tf',epochs=1,
+        sequence_length=3,batch_size=2,validation_fraction=1/3,seed=9,
+        model_config={'potential_field':True,'hidden_size':32})
+    episode(folder/'7100.npz',scene='diagnostic-7100')
+    new=train.train_policy('coverage',folder,tmp_path/'new',tmp_path/'new-tf',epochs=1,
+        sequence_length=3,batch_size=2,validation_fraction=0,seed=19,
+        split_reference_checkpoint=old['best_checkpoint'],
+        model_config={'potential_field':True,'hidden_size':32,'cloud_geometry_encoder':'shared_pool_v1'})
+    assert new['split']['validation_paths']==old['split']['validation_paths']
+    assert 'diagnostic-7100' in new['split']['train_scene_group_ids']
+    state=torch.load(new['best_checkpoint'],weights_only=False)
+    assert state['initial_checkpoint'] is None
+    assert state['train_config']['split_reference_checkpoint_sha256']==hashlib.sha256(
+        Path(old['best_checkpoint']).read_bytes()).hexdigest()
+    loaded=load_policy(new['best_checkpoint']).model
+    assert loaded.gru.input_size==384
+    obs=observation('coverage',1,2)
+    direct=train.create_policy('coverage',state['model_config']);direct.load_state_dict(state['model_state_dict'])
+    torch.testing.assert_close(loaded(obs)[0],direct(obs)[0],atol=0,rtol=0)
+    with pytest.raises(ValueError,match='config|architecture'):
+        train.train_policy('coverage',folder,tmp_path/'bad',tmp_path/'bad-tf',epochs=1,
+            initial_checkpoint=old['best_checkpoint'],model_config={'potential_field':True,
+                'cloud_geometry_encoder':'shared_pool_v1'})

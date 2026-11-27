@@ -24,7 +24,8 @@ class FieldPolicy(_DirectionalRecurrentPolicy):
 
     def __init__(self, task, hidden_size=128, vector_dim=None, mask_previous_command=True,
                  field_frame="world", pan_residual=False, pan_reference="actual",
-                 direction_reference="heading", reference_orbit_radius=1700., reference_radial_gain=2.5):
+                 direction_reference="heading", reference_orbit_radius=1700., reference_radial_gain=2.5,
+                 cloud_geometry_encoder="slots"):
         if task not in {"coverage", "tracking"}:
             raise ValueError("task must be coverage or tracking")
         expected = 111 if task == "coverage" else 134
@@ -47,6 +48,9 @@ class FieldPolicy(_DirectionalRecurrentPolicy):
         self.direction_reference = direction_reference
         self.reference_orbit_radius = float(reference_orbit_radius)
         self.reference_radial_gain = float(reference_radial_gain)
+        if cloud_geometry_encoder not in {"slots", "shared_pool_v1"}:
+            raise ValueError("cloud_geometry_encoder must be slots or shared_pool_v1")
+        self.cloud_geometry_encoder = cloud_geometry_encoder
         super().__init__(expected, hidden_size, True, field_frame, field_frame)
         self.mask_previous_command = bool(mask_previous_command)
         self.model_config = dict(potential_field=True, hidden_size=self.hidden_size,
@@ -55,7 +59,8 @@ class FieldPolicy(_DirectionalRecurrentPolicy):
                                  field_frame=field_frame, pan_residual=self.pan_residual,
                                  pan_reference=pan_reference, direction_reference=direction_reference,
                                  reference_orbit_radius=self.reference_orbit_radius,
-                                 reference_radial_gain=self.reference_radial_gain)
+                                 reference_radial_gain=self.reference_radial_gain,
+                                 cloud_geometry_encoder=cloud_geometry_encoder)
         self.field_encoder = nn.Sequential(
             nn.Conv2d(4, 16, 5, stride=2, padding=2), nn.ReLU(),
             nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
@@ -63,7 +68,10 @@ class FieldPolicy(_DirectionalRecurrentPolicy):
             nn.Flatten(), nn.Linear(32 * 5 * 5, 128), nn.ReLU())
         self.context_encoder = nn.Sequential(nn.Linear(16, 64), nn.ReLU(),
                                              nn.Linear(64, 64), nn.ReLU())
-        self.gru = nn.GRU(320, hidden_size, num_layers=1, batch_first=True)
+        self.cloud_encoder = (nn.Sequential(nn.Linear(4, 32), nn.ReLU(), nn.Linear(32, 32), nn.ReLU())
+                              if cloud_geometry_encoder == "shared_pool_v1" else None)
+        self.gru = nn.GRU(384 if self.cloud_encoder is not None else 320,
+                          hidden_size, num_layers=1, batch_first=True)
         self.pan_head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Linear(64, 1))
 
     def preprocess_vector(self, vector):
@@ -76,7 +84,31 @@ class FieldPolicy(_DirectionalRecurrentPolicy):
         if self.mask_previous_command:
             result = result.clone()
             result[..., 8:10] = 0
+        if self.cloud_geometry_encoder == "shared_pool_v1":
+            result = result.clone()
+            result[..., 14:54] = 0
         return result
+
+    def cloud_geometry(self, obs):
+        """Exact observed cloud geometry in forward/left and hard-boundary units.
+
+        Radius and clearance use the observed task margin, already divided by
+        3000 in vector109/128. No avoidance direction or planner is supplied.
+        """
+        vector = obs["vector"]
+        clouds = vector[..., 14:54].reshape(*vector.shape[:-1], 8, 5)
+        heading = normalize_direction(vector[..., 2:4], vector[..., 2:4]).unsqueeze(-2)
+        forward = heading[..., 0] * clouds[..., 0] + heading[..., 1] * clouds[..., 1]
+        left = -heading[..., 1] * clouds[..., 0] + heading[..., 0] * clouds[..., 1]
+        index = 109 if self.task == "coverage" else 128
+        margin = vector[..., index:index+1]
+        return torch.stack((forward, left, clouds[..., 2] + margin, clouds[..., 3] - margin), -1)
+
+    def encode_clouds(self, obs):
+        clouds = obs["vector"][..., 14:54].reshape(*obs["vector"].shape[:-1], 8, 5)
+        valid = (clouds[..., 4:5] > .5).to(clouds.dtype)
+        embedding = self.cloud_encoder(self.cloud_geometry(obs)) * valid
+        return torch.cat((embedding.max(dim=-2).values, embedding.sum(dim=-2) / 8), -1)
 
     def preprocess_context(self, obs):
         context = obs["field_context"]
@@ -155,6 +187,8 @@ class FieldPolicy(_DirectionalRecurrentPolicy):
         spatial = self.field_encoder(potential.reshape(batch * time, 4, 33, 33))
         encoded = torch.cat((physical, spatial.reshape(batch, time, 128),
                              self.context_encoder(context)), dim=-1)
+        if self.cloud_encoder is not None:
+            encoded = torch.cat((encoded, self.encode_clouds(obs_sequence)), dim=-1)
         recurrent, new_hidden = self.gru(encoded, hidden)
         heading = normalize_direction(obs_sequence["vector"][..., 2:4],
                                       obs_sequence["vector"][..., 2:4])

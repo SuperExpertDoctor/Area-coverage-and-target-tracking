@@ -13,6 +13,7 @@ TF_LOG_DIR="tf-logs/field-v2"
 RUN_NAME="$(date +%Y%m%d-%H%M%S)"
 # Optional explicit inputs. Empty strings use the task's standard output paths.
 CHECKPOINT_PATH=""
+SPLIT_REFERENCE_CHECKPOINT=""
 DATASET_MANIFEST=""
 export PYTHONPYCACHEPREFIX="outputs/cache/python"
 export MPLCONFIGDIR="outputs/cache/matplotlib"
@@ -192,10 +193,11 @@ JSON
 )
 INPUT_ARGS=()
 if [[ -n "$CHECKPOINT_PATH" ]]; then INPUT_ARGS+=(--checkpoint-path "$CHECKPOINT_PATH"); fi
+if [[ -n "$SPLIT_REFERENCE_CHECKPOINT" ]]; then INPUT_ARGS+=(--split-reference-checkpoint "$SPLIT_REFERENCE_CHECKPOINT"); fi
 if [[ -n "$DATASET_MANIFEST" ]]; then INPUT_ARGS+=(--dataset-manifest "$DATASET_MANIFEST"); fi
 exec "$PYTHON" main.py \
   --mode "$MODE" --task both \
-  --config-json "$SIM_CONFIG" --field-mask-previous-command --field-frame body --field-pan-residual --tracking-pan-reference goal --coverage-pan-reference goal --coverage-direction-reference goal_orbit --tracking-direction-reference goal_orbit \
+  --config-json "$SIM_CONFIG" --field-mask-previous-command --field-frame body --field-cloud-geometry-encoder slots --field-pan-residual --tracking-pan-reference goal --coverage-pan-reference goal --coverage-direction-reference goal_orbit --tracking-direction-reference goal_orbit \
   --closed-loop-selection --selection-coverage-seconds 10800 --selection-tracking-seconds 1800 --selection-render-every 60 --selection-workers 2 --selection-tracking-pan-stress 0.3490658503988659 \
   --output-dir "$OUTPUT_DIR" --tf-log-dir "$TF_LOG_DIR" --run-name "$RUN_NAME" \
   --visualize --open-browser --keep-server --host 127.0.0.1 --port 8787 \

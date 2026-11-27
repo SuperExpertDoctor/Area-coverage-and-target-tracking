@@ -46,6 +46,7 @@ Consumes spec/Task 1 shapes. Produces `FieldPolicy(task,hidden_size=128)` separa
 
 - [x] Test mixed protocol rejection, padding/GRU continuity, three-action loss and gradients through field and pan head, checkpoint roundtrip.
 - [x] Implement dynamic action dimension metrics denominator, field dataset loading, TF six relevant tags only.
+- [x] Add optional shared permutation-invariant exact cloud encoder; preserve old slots checkpoints; fresh cross-architecture training pins historical scene splits without copying weights/normalization.
 - [ ] Validate small separate datasets/train and held-out pure-policy closed loops; report failures honestly.
 
 ### Task 4: Entrypoint, replay and visualization integration
@@ -75,3 +76,5 @@ Ruling: work in the current directory on the user-requested new branch, preservi
 The progress-aware goal timeout passed the frozen 24-case field expert suite (16 coverage, 8 tracking), without excluded cases. Two additional six-hour coverage runs completed full revisits, while revealing revisit tails longer than the configured field decay period; selection alternatives are being compared with the field curve unchanged.
 
 Eight canonical expert episodes per task were collected and JSON/NPZ parity checked. Early low-MSE models failed pure-policy closed loops; their weights, failure replays and metrics were retained. Body-frame inputs, explicit radar reference coordinates and validation-only deployment selection address measured failure causes. Final network acceptance remains separate from expert acceptance; the final validation report records the actual outcome.
+
+Coverage epoch31 passed its two validation layouts and four frozen 32000-series tests but collided with a cloud at37s in the exact7100 demonstration. Deployment aliases were withdrawn and its failure artifacts retained. Repair now explicitly adds7100 to TRAIN, uses existing public cloud geometry through the shared encoder and collects expert labels on student-visited TRAIN states. New final seeds32100–32103 were declared before repair training; they must remain untouched until selection is frozen. The original validation layouts12000/12005 remain VAL across fresh architecture training. Full239 tests pass, but the network closed-loop acceptance items remain open.

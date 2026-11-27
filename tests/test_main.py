@@ -66,3 +66,24 @@ def test_main_missing_explicit_checkpoint_does_not_use_a_fallback(tmp_path, monk
     with pytest.raises(FileNotFoundError, match='Explicit checkpoint is missing'):
         main.main(['--mode', 'evaluate', '--checkpoint-path', str(tmp_path / 'missing.pt')]
                   + cli_args(tmp_path, monkeypatch))
+
+
+def test_main_fresh_cloud_encoder_preserves_only_requested_split_reference(tmp_path, monkeypatch):
+    main = importlib.import_module('main')
+    train = importlib.import_module('src.train')
+    reference = tmp_path / 'historical-slots.pt'
+    calls = []
+
+    def capture_training(*args, **kwargs):
+        calls.append(kwargs)
+        return dict(best_checkpoint=str(tmp_path / 'new.pt'), initial_validation_mse=1.,
+                    best_validation_mse=.5, best_epoch=1)
+
+    monkeypatch.setattr(train, 'train_policy', capture_training)
+    main.main(['--mode', 'train', '--potential-field', '--no-closed-loop-selection',
+               '--field-cloud-geometry-encoder', 'shared_pool_v1',
+               '--split-reference-checkpoint', str(reference)] + cli_args(tmp_path, monkeypatch))
+    assert len(calls) == 1
+    assert calls[0]['model_config']['cloud_geometry_encoder'] == 'shared_pool_v1'
+    assert calls[0]['split_reference_checkpoint'] == reference
+    assert calls[0]['initial_checkpoint'] is None

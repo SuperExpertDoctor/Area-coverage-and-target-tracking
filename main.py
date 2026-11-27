@@ -24,6 +24,8 @@ def parser():
                    help='Field-v2 model: mask previous command to reduce action-copy shortcuts')
     p.add_argument('--field-frame', choices=['body','world'], default='body',
                    help='Field-v2 internal frame; public observations/actions always use world axes')
+    p.add_argument('--field-cloud-geometry-encoder',choices=['slots','shared_pool_v1'],default='slots',
+                   help='Fresh field model: original cloud slots or a shared permutation-invariant cloud encoder')
     p.add_argument('--field-pan-residual', action=argparse.BooleanOptionalAction, default=True,
                    help='Field-v2 radar head predicts correction from observed actual pan')
     p.add_argument('--tracking-pan-reference', choices=['actual','goal'],default='goal',
@@ -84,6 +86,8 @@ def parser():
     p.add_argument('--dagger-recovery-min-steps',type=int,default=0,
                    help='Minimum training action exposures per accepted DAgger prefix; 0 disables repeats')
     p.add_argument('--checkpoint-path',type=Path,default=None)
+    p.add_argument('--split-reference-checkpoint',type=Path,default=None,
+                   help='Fresh training: preserve historical scene splits without loading its model weights or normalization')
     p.add_argument('--warm-start',action=argparse.BooleanOptionalAction,default=False)
     p.add_argument('--coverage-ego-map',action=argparse.BooleanOptionalAction,default=False,
                    help='Add observed aircraft position/heading channels inside the coverage CNN')
@@ -258,6 +262,7 @@ def main(argv=None):
                 if cfg.potential_enabled:
                     model_config={'potential_field':True,'mask_previous_command':args.field_mask_previous_command,
                                   'field_frame':args.field_frame,'pan_residual':args.field_pan_residual,
+                                  'cloud_geometry_encoder':args.field_cloud_geometry_encoder,
                                   'pan_reference':args.tracking_pan_reference if task=='tracking' else args.coverage_pan_reference}
                     if task=='coverage':
                         model_config.update(direction_reference=args.coverage_direction_reference,
@@ -326,6 +331,7 @@ def main(argv=None):
                     dagger_recovery_min_steps=args.dagger_recovery_min_steps,
                     model_config=model_config,
                     initial_checkpoint=initial_checkpoint,
+                    split_reference_checkpoint=args.split_reference_checkpoint,
                     metadata={'simulation_config':asdict(cfg),'command':run_config})
                 item['training']=training
                 checkpoint=Path(training['best_checkpoint'])
