@@ -56,7 +56,10 @@ def freeze_latest(task, model_dir, frozen_dir):
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.read_bytes() != payload:
         raise ValueError('Frozen checkpoint bytes changed')
-    target.write_bytes(payload)
+    if not target.exists():
+        temporary=target.with_suffix('.pt.tmp')
+        temporary.write_bytes(payload)
+        temporary.replace(target)
     return dict(path=str(target.resolve()), source=str(source.resolve()), sha256=sha,
                 epoch=state['epoch'])
 
@@ -250,6 +253,8 @@ def run_formal(args, config, tasks, server, command):
     from .collection import collect_expert_episodes
     from .train import train_policy
     out = Path(args.output_dir).resolve()
+    if not config.potential_enabled:
+        raise ValueError('Formal run requires field-v2; use --potential-field')
     if args.browser_recording and server is None:
         raise ValueError('Browser recording requires --visualize')
     if args.browser_recording:

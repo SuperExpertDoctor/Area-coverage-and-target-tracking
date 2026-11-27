@@ -131,7 +131,29 @@ def test_correction_gets_independent_forecast_not_blind_guidance_trust():
     clouds=[{'x':102500.,'y':100000.,'radius':700.}]
     policy=ForecastConstrainedPolicy(FixedPolicy([1.,0.,.2]),c,'coverage')
     policy.safety.direction=lambda *args,**kwargs:np.array([1.,0.],dtype=np.float32)
-    with pytest.raises(NoFeasibleAction):policy.act(observation(c,state,clouds=clouds))
+    action=policy.act(observation(c,state,clouds=clouds))
+    assert not np.array_equal(action[:2],[1.,0.])
+    assert policy.execution_metadata['candidate_repairs']==1
+    run_physical_forecast(state,action,clouds,c)
+
+
+def test_real_two_cloud_state_searches_feasible_commands_after_guidance_failure():
+    from policy_constraints import ForecastConstrainedPolicy
+    from expert_tracking import ExpertPlanningError
+    c=Config(potential_enabled=True)
+    state=FixedWingState(156984.52511848893,220785.2703536365,1.670145189810091,-0.3424973261637107)
+    clouds=[dict(id=0,x=156738.27522650704,y=222259.3256331335,radius=590.2463129176264),
+            dict(id=1,x=158845.03646765364,y=221310.22431732411,radius=994.9994412455898)]
+    raw=np.array([0.7909485101699829,0.6118826866149902,0.4485338628292084],np.float32)
+    policy=ForecastConstrainedPolicy(FixedPolicy(raw),c,'coverage')
+    def failed(*args,**kwargs):
+        raise ExpertPlanningError('Generic candidate set missed a feasible direction')
+    policy.safety.direction=failed
+    action=policy.act(observation(c,state,clouds=clouds))
+    assert action[2].view(np.uint32)==raw[2].view(np.uint32)
+    assert policy.execution_metadata['candidate_repairs']==1
+    assert policy.execution_metadata['task_expert_fallback'] is False
+    run_physical_forecast(state,action,clouds,c)
 
 
 def test_reset_clears_base_recurrent_state_side_memory_and_all_counters():

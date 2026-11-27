@@ -15,7 +15,7 @@ from observations import observation_metadata
 
 
 class NoFeasibleAction(RuntimeError):
-    """Neither the raw command nor the generic correction passed the forecast."""
+    """Neither raw, generic nor searched commands passed the finite forecast."""
 
 
 class ForecastConstrainedPolicy:
@@ -41,11 +41,13 @@ class ForecastConstrainedPolicy:
     @property
     def execution_metadata(self):
         return dict(mode='forecast_constraint', heuristic_constraint=True,
+                    constraint_version='forecast-v2-candidate-search',
                     task_expert_fallback=False, task=self.task,
                     horizon=float(self.config.expert_safety_horizon),
                     projection_dt=float(self.config.expert_safety_projection_dt),
                     checked_actions=self._checked, interventions=self._interventions,
                     failed_actions=self._failed, forecast_checks=self._forecasts,
+                    candidate_repairs=self._candidate_repairs,
                     reachable_disk_checks=self._fast_checks)
 
     def _clear_history(self):
@@ -54,6 +56,31 @@ class ForecastConstrainedPolicy:
         self.last_intervened = False
         self._checked = self._interventions = self._failed = 0
         self._forecasts = self._fast_checks = 0
+        self._candidate_repairs = 0
+
+    def _candidate_repair(self,uav,raw,clouds,previous):
+        """Search public geometric commands; never query a task expert/goal.
+
+        A generic tangent heuristic may miss a narrow feasible interval between
+        clouds. Independently forecast nearby directions and the previous safe
+        command before declaring failure. Angular offsets remain explicit in
+        the existing run.sh configuration.
+        """
+        angle=(uav.heading if math.hypot(float(raw[0]),float(raw[1]))<1e-6
+               else math.atan2(float(raw[1]),float(raw[0])))
+        offsets=set(self.config.field_heading_offsets)|set(self.config.expert_safety_heading_offsets)
+        candidates=[np.array([math.cos(base+offset),math.sin(base+offset)],dtype=np.float32)
+                    for base in (angle,uav.heading) for offset in sorted(offsets)]
+        if previous is not None:
+            candidates.append(previous[:2].copy())
+        def distance(xy):
+            delta=math.atan2(float(xy[1]),float(xy[0]))-angle
+            return abs(math.atan2(math.sin(delta),math.cos(delta)))
+        for xy in sorted(candidates,key=distance):
+            if self._safe(uav,xy,clouds):
+                self._candidate_repairs+=1
+                return xy
+        return None
 
     def reset(self):
         self.base_policy.reset()
@@ -135,6 +162,7 @@ class ForecastConstrainedPolicy:
         if raw.shape != (3,) or not np.isfinite(raw).all() or np.any(np.abs(raw) > 1.):
             raise ValueError('Base policy action must be a finite float32 three-vector in [-1,1]')
         raw = raw.copy()
+        previous=None if self.last_applied_action is None else self.last_applied_action.copy()
         self.last_raw_action = raw.copy()
         self.last_applied_action = None
         self.last_intervened = False
@@ -151,13 +179,14 @@ class ForecastConstrainedPolicy:
             buffer = c.expert_obstacle_buffer if self.task == 'coverage' else min(c.expert_obstacle_buffer, c.tracking_range_guard)
             try:
                 xy = np.asarray(self.safety.direction(uav, raw[:2], clouds, obstacle_buffer=buffer), dtype=np.float32)
-            except ExpertPlanningError as exc:
-                self._failed += 1
-                raise NoFeasibleAction(str(exc)) from exc
-            if (xy.shape != (2,) or not np.isfinite(xy).all() or np.any(np.abs(xy) > 1.)
+            except ExpertPlanningError:
+                xy=None
+            if (xy is None or xy.shape != (2,) or not np.isfinite(xy).all() or np.any(np.abs(xy) > 1.)
                     or not self._safe(uav, xy, clouds)):
+                xy=self._candidate_repair(uav,raw,clouds,previous)
+            if xy is None:
                 self._failed += 1
-                raise NoFeasibleAction('Generic correction failed the independent physical forecast')
+                raise NoFeasibleAction('No searched command passed the independent physical forecast')
             applied = raw.copy()
             applied[:2] = xy
             self.last_intervened = True

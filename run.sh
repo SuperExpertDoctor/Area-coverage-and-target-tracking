@@ -18,7 +18,6 @@ RESUME_CHECKPOINT=""
 DATASET_MANIFEST=""
 export PYTHONPYCACHEPREFIX="outputs/cache/python"
 export MPLCONFIGDIR="outputs/cache/matplotlib"
-export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 export PYTHONUNBUFFERED=1
 # Set before NumPy loads in the parent or spawned workers; training sets its
