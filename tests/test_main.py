@@ -87,3 +87,18 @@ def test_main_fresh_cloud_encoder_preserves_only_requested_split_reference(tmp_p
     assert calls[0]['model_config']['cloud_geometry_encoder'] == 'shared_pool_v1'
     assert calls[0]['split_reference_checkpoint'] == reference
     assert calls[0]['initial_checkpoint'] is None
+
+
+def test_field_evaluation_requires_selected_model_instead_of_falling_back_to_best(tmp_path, monkeypatch):
+    main = importlib.import_module('main')
+    policy = importlib.import_module('src.policy_tracking')
+    candidate = tmp_path / 'models' / 'tracking' / 'best.pt'
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b'unvalidated or withdrawn model')
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail('default field deployment must not fall back to an offline best candidate')
+
+    monkeypatch.setattr(policy.NeuralPolicy, 'from_checkpoint', unexpected_load)
+    with pytest.raises(FileNotFoundError, match='selected.pt'):
+        main.main(['--mode', 'evaluate', '--potential-field'] + cli_args(tmp_path, monkeypatch))

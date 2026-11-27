@@ -61,6 +61,8 @@ T 是信息价值失效周期：刚扫描 P=-1，按归一化指数恢复，在 
 
 `best.pt` 保留离线验证损失最低含义；`last.pt` 为最后训练轮；`selected.pt` 只在验证场景闭环全部通过后生成。选择时先冻结候选字节和SHA，元数据从相同字节解析，避免并发改写污染验证划分；独立测试不参与选模。测试失败后保留原结果，将后续修复使用新的预先声明测试集。
 
+默认field-v2部署评估必须找到 `selected.pt`；不存在时明确报错，不再自动回退到离线 `best.pt`。该入口漏洞通过先失败的回归测试复现并修复，相关33项测试通过。研究诊断仍可显式指定 `--checkpoint-path`；这样运行的候选不能自动获得部署资格。
+
 ## 本地演示与复现
 
 默认全部参数在 `run.sh`，输出目录与TF目录均通过CLI传入。`bash run.sh expert`、`collect`、`train`、`dagger`、`evaluate`、`serve` 对应独立阶段。Windows可设置 `PYTHON=D:/miniconda/python.exe` 后用Git Bash调用。

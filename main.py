@@ -255,6 +255,10 @@ def main(argv=None):
                     'config':asdict(short_cfg),'collection_seed':args.collection_seed})
             model_dir=out/'models'/task
             deployment=model_dir/'selected.pt'
+            if (args.mode=='evaluate' and cfg.potential_enabled and args.closed_loop_selection
+                    and args.checkpoint_path is None and not deployment.is_file()):
+                raise FileNotFoundError(f'No validated deployment checkpoint: {deployment}. '
+                    'Run closed-loop selection first, or specify --checkpoint-path for diagnostic evaluation.')
             checkpoint=args.checkpoint_path or (deployment if cfg.potential_enabled and args.closed_loop_selection and deployment.exists() else model_dir/'best.pt')
             if args.mode in ['all','train','dagger']:
                 from src.train import train_policy
