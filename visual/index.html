@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a1520">
+  <title>海空联合调度 · 仿真控制台</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='8' fill='%230a141e'/%3E%3Cpath d='m9 25 11-17 11 17-11-5Z' fill='none' stroke='%2370ddd6' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <a class="brand" href="/" aria-label="海空联合调度首页">
+        <svg viewBox="0 0 40 40" aria-hidden="true"><circle cx="20" cy="20" r="17"/><path d="m10 23 10-13 10 13M10 28l10-5 10 5M20 10v13"/></svg>
+        <div><h1>海空联合调度</h1><span>MARITIME SIMULATION</span></div>
+      </a>
+      <nav class="task-tabs" aria-label="任务选择">
+        <button class="task-tab active" data-task="coverage" aria-pressed="true">区域覆盖<span>01</span></button>
+        <button class="task-tab" data-task="tracking" aria-pressed="false">协同跟踪<span>02</span></button>
+      </nav>
+      <div class="connection"><i id="connection-dot"></i><span id="connection-text">连接实时服务</span></div>
+    </header>
+
+    <section class="source-bar" aria-label="数据源与策略">
+      <div class="segmented source-switch"><button id="history-mode" class="active" aria-pressed="true">历史回放</button><button id="live-mode" aria-pressed="false">实时仿真</button></div>
+      <span class="bar-divider"></span>
+      <label class="control-label" for="actor">控制策略</label>
+      <select id="actor" class="compact-select"><option value="expert">专家策略</option><option value="policy">行为克隆网络</option></select>
+      <label class="sr-only" for="replay-select">选择回放记录</label>
+      <select id="replay-select" class="replay-select"><option value="">正在读取回放记录…</option></select>
+      <button id="refresh" class="icon-button" title="刷新回放列表" aria-label="刷新回放列表"><svg viewBox="0 0 20 20"><path d="M16 6V2m0 4h-4M16 6a7 7 0 1 0 1 7"/></svg></button>
+      <label class="upload-button" for="replay-file"><svg viewBox="0 0 20 20"><path d="M10 13V3m-4 4 4-4 4 4M3 13v4h14v-4"/></svg>导入 JSON</label>
+      <input id="replay-file" type="file" accept=".json,application/json" hidden>
+    </section>
+
+    <main class="workspace">
+      <section class="map-panel" aria-label="任务态势图">
+        <div class="map-topbar"><div><h2>任务态势</h2><span id="map-extent">300 × 300 km 海域</span></div><div class="view-switch segmented" aria-label="视角选择"><button data-view="mission" class="active" aria-pressed="true">任务区</button><button data-view="overview" aria-pressed="false">全域</button><button data-view="uav" aria-pressed="false">跟随无人机</button><button data-view="ship" aria-pressed="false">跟随船舶</button></div></div>
+        <div class="layer-toolbar" aria-label="图层与轨迹显示">
+          <label title="按UAV实际经过位置记录，离开后按仿真时间渐淡，不表示雷达覆盖"><input id="show-grid" type="checkbox" checked>经过网格</label>
+          <label title="独立的雷达扫描信息年龄图层"><input id="show-age" type="checkbox" checked>雷达覆盖年龄</label>
+          <span class="layer-separator"></span>
+          <label><input id="show-trail" type="checkbox" checked>轨迹</label>
+          <label class="sr-only" for="trail-style">轨迹样式</label><select id="trail-style"><option value="meteor">流星尾迹 · 60s</option><option value="history">完整历史</option></select>
+          <output id="grid-summary" class="grid-summary">250 m · 600s 渐淡</output>
+        </div>
+        <div class="map-container" id="map-container">
+          <canvas id="map" aria-label="海域、云区、岛屿、无人机航迹、船舶航迹及雷达视场"></canvas>
+          <div class="map-coordinate" id="coordinate">局部笛卡尔坐标 · km</div>
+          <div class="north-indicator" aria-hidden="true"><span>N / +Y</span><svg viewBox="0 0 20 30"><path d="M10 2 3 22l7-5 7 5Z"/></svg></div>
+          <div class="zoom-controls"><button id="zoom-in" aria-label="放大海图">+</button><button id="zoom-out" aria-label="缩小海图">−</button><button id="reset-view" title="重置视角" aria-label="重置视角"><svg viewBox="0 0 20 20"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m6 0h4v-4M7 10h6m-3-3v6"/></svg></button></div>
+          <div class="empty-state" id="empty-state"><svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="20"/><path d="M26 6v20l14 14M6 26h40M26 46V26"/></svg><h3>等待仿真数据</h3><p id="empty-message">选择已生成的回放，或切换实时仿真。</p></div>
+          <div class="map-legend"><span><i class="legend-line uav"></i>无人机</span><span><i class="legend-line ship"></i>科考船</span><span><i class="legend-sector"></i>雷达视场</span><span id="visit-key"><i class="legend-visit"></i>经过：新深 → 旧浅</span></div>
+          <div class="scale-bar"><i id="scale-line"></i><span id="scale-label">50 km</span></div>
+          <div class="age-key" id="age-key"><span>雷达近期观测</span><i></i><span>陈旧 / 未覆盖</span></div>
+        </div>
+        <div class="map-bottom"><span><i class="air-dot"></i>云区：空中禁入 <b id="cloud-count">—</b></span><span><i class="sea-dot"></i>岛屿：海面禁入 <b id="island-count">—</b></span><span class="map-hint">拖动平移 · 滚轮缩放</span></div>
+      </section>
+
+      <aside class="mission-panel" aria-label="任务数据">
+        <div class="mission-heading"><h2>任务监测</h2><span class="data-label" id="data-label">无数据</span></div>
+        <div class="mission-meta"><span id="mission-task">区域覆盖任务</span><span id="seed-label">SEED —</span></div>
+        <div class="primary-metric"><span id="primary-label">累计覆盖率</span><div><strong id="primary-value">—</strong><span id="primary-unit">%</span></div><div class="metric-track"><i id="metric-progress"></i></div><p id="metric-description">等待实际仿真帧</p></div>
+        <div class="metric-grid"><div><span id="secondary-label">平均信息年龄</span><strong id="secondary-value">—</strong><small id="secondary-unit">s</small></div><div><span id="tertiary-label">最大信息年龄</span><strong id="tertiary-value">—</strong><small id="tertiary-unit">s</small></div><div><span>机船距离</span><strong id="distance-value">—</strong><small>km</small></div><div><span>雷达探测</span><strong id="visibility-value">—</strong><small id="visibility-unit"></small></div></div>
+        <div class="trend-heading"><h3 id="trend-title">覆盖率历程</h3><span id="trend-range">—</span></div><canvas id="trend" aria-label="当前回放的真实指标历程"></canvas>
+        <section class="platforms" aria-label="平台状态">
+          <div class="platform"><img src="/figs/ch4-uav.jpg" alt="2022 珠海航展上的彩虹 CH-4 固定翼无人机实拍" width="84" height="64"><div class="platform-content"><h3><i class="platform-dot uav"></i>彩虹 CH-4 <span>固定翼</span></h3><div class="platform-values"><span><b id="uav-speed">—</b> m/s</span><span>航向 <b id="uav-heading">—</b>°</span></div><div class="platform-secondary">滚转角 <span id="uav-bank">—</span>°</div></div></div>
+          <div class="platform"><img src="/figs/research-vessel.jpg" alt="科考船 R/V Atlantis 真实照片，作为科考船外观参考" width="84" height="64"><div class="platform-content"><h3><i class="platform-dot ship"></i>科考船 <span>海面平台</span></h3><div class="platform-values"><span><b id="ship-speed">—</b> m/s</span><span>航向 <b id="ship-heading">—</b>°</span></div><div class="platform-secondary">实际舵角 <span id="ship-rudder">—</span>°</div></div></div>
+        </section>
+        <div class="sensor-row"><span>雷达方位偏置</span><b id="radar-offset">—</b><span>有效距离</span><b id="radar-range">—</b></div>
+        <details class="asset-credits"><summary>素材与显示说明</summary><p>照片为真实外观参考；二维模型按物理长宽与地图比例绘制，过小时保留最小可见像素，并沿实际速度旋转。雷达始终使用仿真物理距离。经过网格仅记录UAV通行，按仿真时间渐淡，区别于雷达覆盖年龄。航向 0° 指向 +X（东），逆时针为正。云区与岛屿边界来自仿真，海水纹理不代表真实地理。</p><a href="/figs/sources.json" target="_blank" rel="noopener">图片来源、许可与处理记录 ↗</a></details>
+      </aside>
+    </main>
+
+    <section class="playback" aria-label="回放控制">
+      <button id="play" class="play-button" aria-label="播放回放" disabled><svg id="play-icon" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7Z"/></svg></button>
+      <button id="restart" class="icon-button" aria-label="从头回放" title="从头回放"><svg viewBox="0 0 20 20"><path d="M4 4v12M15 4 6 10l9 6Z"/></svg></button>
+      <div class="time-display"><strong id="current-time">00:00</strong><span>/ <span id="total-time">00:00</span></span></div>
+      <div class="timeline"><label class="sr-only" for="seek">回放时间</label><input id="seek" type="range" min="0" max="0" value="0" step="1" disabled><div class="timeline-ticks"><span>起点</span><span id="timeline-middle">—</span><span id="timeline-end">终点</span></div></div>
+      <label class="sr-only" for="speed">回放速度</label><select id="speed" class="speed-select"><option value="1">1×</option><option value="5">5×</option><option value="20">20×</option><option value="60" selected>60×</option><option value="120">120×</option></select>
+      <div class="frame-count" id="frame-count">0 帧</div>
+    </section>
+    <footer class="status-bar"><span id="status" role="status" aria-live="polite">正在读取本地回放记录…</span><span>坐标与距离使用米制 · 所有指标来自仿真</span></footer>
+  </div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

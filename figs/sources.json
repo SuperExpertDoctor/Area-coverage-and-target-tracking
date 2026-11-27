@@ -1,0 +1,58 @@
+{
+  "assets": [
+    {
+      "file": "ch4-uav.jpg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/a/a8/CH-4_at_Airshow_China_Zhuhai_2022.jpg",
+      "source": "https://commons.wikimedia.org/wiki/File:CH-4_at_Airshow_China_Zhuhai_2022.jpg",
+      "title": "CH-4 at Airshow China Zhuhai 2022",
+      "author": "Infinty 0",
+      "license": "CC BY-SA 4.0",
+      "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+      "changes": "Original photograph, unchanged. UI uses CSS object-fit crop.",
+      "sha256": "97746a103e9de8bc01402a3e46190a94c534ecd308ae1488039016e0cddcbf55",
+      "bytes": 1304327
+    },
+    {
+      "file": "research-vessel.jpg",
+      "url": "https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/media/images/atlantis1-hires.jpg",
+      "source": "https://www.usgs.gov/media/images/rv-atlantis",
+      "title": "R/V Atlantis",
+      "author": "Kenneth Kostel, Woods Hole Oceanographic Institution; USGS image collection",
+      "license": "Public domain (as stated by USGS)",
+      "license_url": "https://www.usgs.gov/media/images/rv-atlantis",
+      "changes": "Original photograph, unchanged. UI uses CSS object-fit crop.",
+      "sha256": "498f468de0531900163006f88417ec61f58203620ac991f4baaa138f34b98a4b",
+      "bytes": 294113
+    },
+    {
+      "file": "ocean.jpg",
+      "url": "https://upload.wikimedia.org/wikipedia/commons/2/26/Sea_wave_abstract_texture_%28Unsplash%29.jpg",
+      "source": "https://commons.wikimedia.org/wiki/File:Sea_wave_abstract_texture_(Unsplash).jpg",
+      "title": "Sea wave abstract texture",
+      "author": "Lukas Blazek / goumbik",
+      "license": "CC0 1.0",
+      "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "changes": "Original photograph preserved. ocean-map.jpg is resized and darkened for map legibility.",
+      "sha256": "b0c68f3dd14a1e42abbf1e49e3c439a7232225b8bf9ff1723fbc2b5fa1e20400",
+      "bytes": 16387578
+    }
+  ],
+  "map_symbols": "Loaded original schematic 2D model SVG assets uav-model.svg and ship-model.svg; not downloaded 3D CAD. Forward axis +X; rotate from actual velocity with physical heading fallback at zero speed.",
+  "ocean_map": "ocean-map.jpg is a derivative of ocean.jpg (CC0), resized, desaturated and darkened.",
+  "schematic_models": [
+    {
+      "file": "uav-model.svg",
+      "description": "CH family fixed-wing UAV schematic top view",
+      "creator": "Project visualization implementation",
+      "license": "CC0 1.0",
+      "forward_axis": "+X"
+    },
+    {
+      "file": "ship-model.svg",
+      "description": "Research-vessel schematic top view",
+      "creator": "Project visualization implementation",
+      "license": "CC0 1.0",
+      "forward_axis": "+X"
+    }
+  ]
+}

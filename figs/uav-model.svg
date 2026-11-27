@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="CH family fixed wing UAV schematic 2D top view, nose toward positive X">
+  <defs><linearGradient id="body" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#ecfff8"/><stop offset=".48" stop-color="#a6ece0"/><stop offset=".55" stop-color="#8ed2ca"/><stop offset="1" stop-color="#598b8d"/></linearGradient><linearGradient id="wing"><stop stop-color="#609fa1"/><stop offset=".65" stop-color="#b9f3e4"/><stop offset="1" stop-color="#e4fff5"/></linearGradient></defs>
+  <!-- Original schematic, not a manufacturer CAD model. Geometry points +X. -->
+  <g stroke="#d1f7ec" stroke-width="1.2" stroke-linejoin="round">
+    <path d="M111 94 91 13 84 11 88 93 67 96 67 104 88 107 84 189 91 187 111 106Z" fill="url(#wing)"/>
+    <path d="m69 96-17-28-9-1 10 29-2 4 2 4-10 29 9-1 17-28Z" fill="url(#wing)"/>
+    <path d="M52 97h17c8-2 16-3 25-3h40c16 0 27 2 37 6-10 4-21 6-37 6H94c-9 0-17-1-25-3H52Z" fill="url(#body)"/>
+  </g>
+  <path d="M121 96h16c8 0 14 1 20 4-6 3-12 4-20 4h-16Z" fill="#44737b"/>
+  <path d="M125 97h13l10 3h-23Z" fill="#a7dedb"/>
+  <g fill="none" stroke="#41777d" stroke-width="1"><path d="m90 15 13 77M89 185l14-77M52 98h28m-28 4h28M81 96v8m34-9v10M96 37l-8 1m13 26-11 1m6 98-8-1m13-26-11-1"/><path d="M87 82h13m-13 36h13"/></g>
+  <path d="M51 87v26" fill="none" stroke="#d9fff2" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="51" cy="100" r="2.4" fill="#effff5"/>
+  <g fill="#496e76"><path d="m101 67 2 8-7 1-1-8Zm0 66 2-8-7-1-1 8Z"/><path d="m79 94 3 5-4 2-3-5Z"/></g>
+  <circle cx="151" cy="100" r="2" fill="#d9fff4"/>
+</svg>

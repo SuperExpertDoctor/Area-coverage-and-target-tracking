@@ -1,0 +1,10 @@
+# src/dynamics.py itself uses only the Python standard library.
+numpy
+matplotlib
+pytest
+gymnasium>=1.0,<2
+torch>=2.2
+tensorboard>=2.15
+Pillow
+imageio
+imageio-ffmpeg

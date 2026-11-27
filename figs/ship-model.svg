@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 90" role="img" aria-label="Research vessel schematic 2D top view, bow toward positive X">
+  <defs><linearGradient id="hull" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#fff0c9"/><stop offset=".5" stop-color="#f4ca88"/><stop offset="1" stop-color="#a57746"/></linearGradient><linearGradient id="deck"><stop stop-color="#e5e5cf"/><stop offset="1" stop-color="#b4c3b8"/></linearGradient></defs>
+  <!-- Original schematic research-vessel model; not downloaded or 3D CAD. -->
+  <path d="M21 17H133c34 0 55 11 73 28-18 17-39 28-73 28H21l-8-7V24Z" fill="url(#hull)" stroke="#ffe8ba" stroke-width="2"/>
+  <path d="M24 22h108c29 0 47 8 65 23-18 15-36 23-65 23H24l-6-5V27Z" fill="url(#deck)" stroke="#9d9379"/>
+  <path d="M25 26h61v38H25Z" fill="#5e8790" stroke="#bdd5cc"/>
+  <path d="M99 26h42l8 8v22l-8 8H99Z" fill="#f2f1d9" stroke="#789395" stroke-width="1.5"/>
+  <path d="M113 30h31l5 5v20l-5 5h-31Z" fill="#d2ded0" stroke="#9eaa95"/>
+  <path d="M135 32h10l8 13-8 13h-10Z" fill="#335962"/>
+  <path d="M138 34h5l6 10h-11Zm0 12h11l-6 10h-5Z" fill="#8eb3b3"/>
+  <path d="M162 36h13v18h-13Z" fill="#d4ddcc" stroke="#8d9e8e"/>
+  <g fill="#324e59" stroke="#b1c4b9" stroke-width="1"><rect x="104" y="33" width="12" height="24" rx="2"/><rect x="89" y="31" width="8" height="28" rx="1"/></g>
+  <g fill="none" stroke="#dbc391" stroke-width="3"><path d="M27 29v32m0-30h34v9M27 59h34v-9"/><path d="M36 31v28"/></g>
+  <g fill="none" stroke="#596e71" stroke-width="1.5"><path d="M122 25v40m-7-19h21M183 41v8m-3-4h6"/><circle cx="122" cy="45" r="6"/><path d="M18 24h61M18 66h61"/></g>
+  <g fill="#f6faf0" stroke="#6e9093" stroke-width="1"><rect x="53" y="23" width="22" height="5" rx="2.5"/><rect x="53" y="62" width="22" height="5" rx="2.5"/></g>
+  <g fill="#446671"><circle cx="84" cy="27" r="2"/><circle cx="84" cy="63" r="2"/><circle cx="157" cy="30" r="2"/><circle cx="157" cy="60" r="2"/></g>
+</svg>
