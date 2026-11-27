@@ -65,7 +65,14 @@ def write_json(path, value):
     tmp = path.with_suffix(path.suffix + '.tmp')
     tmp.write_text(json.dumps(json_value(value), ensure_ascii=False,
                               allow_nan=False, separators=(',', ':')), encoding='utf-8')
-    tmp.replace(path)
+    for attempt in range(8):
+        try:
+            tmp.replace(path)
+            break
+        except PermissionError:
+            if attempt == 7:
+                raise
+            time.sleep(.01*2**attempt)
 
 
 def restore_training_cache(json_path, npz_path=None):
@@ -97,7 +104,8 @@ def write_replay_index(path,record):
 def run_episode(env, actor, *, seed, actor_name, output_dir, name,
                 record_observations=False, max_steps=None, server=None,
                 render_every=1, realtime_factor=0., scene=None,
-                progress_every=300, expert_labeler=None, mixture_beta=0., mixture_seed=None):
+                progress_every=300, expert_labeler=None, mixture_beta=0., mixture_seed=None,
+                replay_every=1):
     """Run the same closed loop for experts, deployment and DAgger collection.
 
     Original expert demonstrations must finish without physical/tracking failure.
@@ -107,7 +115,9 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     excluded by SequenceDataset's T+1-to-T input slicing. Unexpected errors still
     propagate and never produce an accepted training cache.
     """
-    if render_every < 1 or progress_every < 1 or realtime_factor < 0 or not 0<=mixture_beta<=1:
+    if (isinstance(replay_every, bool) or not isinstance(replay_every, int) or
+            render_every < 1 or replay_every < 1 or progress_every < 1 or
+            realtime_factor < 0 or not 0<=mixture_beta<=1):
         raise ValueError('Invalid rendering cadence or playback speed')
     constrained=bool(getattr(actor,'execution_metadata',None))
     if constrained and (actor_name!='policy' or expert_labeler is not None):
@@ -139,6 +149,8 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
         server.publish({'type': 'scene', 'scene': scene_spec, 'task': task, 'actor': actor_name,
                         'metadata': behavior_metadata})
     frames, actions, executed = [json_value(env.render())], [], []
+    frame_action_indices = [0]
+    state = frames[0]
     expert_actions=[];policy_actions=[];expert_controls=0
     raw_policy_actions=[];constraint_interventions=[]
     sequences = {k: [np.array(v, copy=True)] for k, v in obs.items()} if record_observations else {}
@@ -162,7 +174,7 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
                     action=expert_action.copy();expert_controls+=1
         except Exception as error:
             planning_failure = {'type':type(error).__name__,'message':str(error),
-                                'step':step_index,'t':frames[-1]['t']}
+                                'step':step_index,'t':state['t']}
             if constrained and getattr(actor,'last_raw_action',None) is not None:
                 planning_failure['raw_policy_action']=json_value(actor.last_raw_action)
             terminated = True
@@ -178,30 +190,50 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
             raw_policy_actions.append(raw_action.tolist())
             constraint_interventions.append(bool(actor.last_intervened))
         obs, _, terminated, truncated, info = env.step(action)
-        frame = json_value(env.render())
-        frames.append(frame)
+        save_frame = (step_index + 1) % replay_every == 0 or terminated or truncated
+        live_frame = server and (step_index + 1) % render_every == 0
+        if save_frame or live_frame or not hasattr(env, 'uav_model'):
+            state = json_value(env.render())
+        else:
+            # Rendering field/grid tensors is expensive and unnecessary for
+            # training. Read the identical physical velocity used by render().
+            vx, vy = env.uav_model.velocity(env.uav)
+            state = {'t': env.t, 'uav': {'vx': vx, 'vy': vy},
+                     'radar': {'pan': getattr(env, 'radar_pan', 0.)},
+                     'coverage': {'ratio': info.get('coverage_ratio', 0.)},
+                     'metrics': {'distance': info.get('distance', 0.)}}
+        if save_frame:
+            frames.append(state)
+            frame_action_indices.append(step_index + 1)
         actions.append(action.tolist())
         if expert_labeler is not None:
             expert_actions.append(expert_action.tolist());policy_actions.append(policy_action.tolist())
-        u = frame['uav']
+        u = state['uav']
         speed = math.hypot(u['vx'], u['vy'])
         actual = [u['vx'] / speed, u['vy'] / speed]
         if field_mode:
             limit = env.config.coverage_pan_limit if task == 'coverage' else env.config.pan_limit
-            actual.append(float(frame['radar']['pan']) / limit)
+            actual.append(float(state['radar']['pan']) / limit)
         executed.append(actual)
         if record_observations:
             for k, value in obs.items():
                 sequences[k].append(np.array(value, copy=True))
         step_index += 1
         if server and step_index % render_every == 0:
-            server.publish({'type': 'frame', 'frame': frame})
+            server.publish({'type': 'frame', 'frame': state, 'action_index': step_index})
         if step_index % progress_every == 0:
-            c = frame.get('coverage', {}).get('ratio', 0.)
-            d = frame.get('metrics', {}).get('distance', 0.)
-            print(f'[{task}/{actor_name}] t={frame["t"]:.0f}s coverage={c:.3f} distance={d:.0f}m', flush=True)
+            c = state.get('coverage', {}).get('ratio', 0.)
+            d = state.get('metrics', {}).get('distance', 0.)
+            print(f'[{task}/{actor_name}] t={state["t"]:.0f}s coverage={c:.3f} distance={d:.0f}m', flush=True)
+            if server:
+                server.publish({'type': 'progress', 'task': task, 'actor': actor_name,
+                                'steps': step_index, 'time_seconds': state['t'],
+                                'coverage_ratio': c, 'distance': d})
         if realtime_factor:
-            time.sleep(max(0., frame['t'] / realtime_factor - (time.perf_counter() - start)))
+            time.sleep(max(0., state['t'] / realtime_factor - (time.perf_counter() - start)))
+    if frame_action_indices[-1] != step_index:
+        frames.append(json_value(env.render()))
+        frame_action_indices.append(step_index)
     summary = json_value(env.summary())
     summary.update(steps=step_index, wall_seconds=time.perf_counter() - start,
                    terminated=bool(terminated), truncated=bool(truncated))
@@ -232,6 +264,7 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     record = {'schema_version': REPLAY_SCHEMA, 'task': task, 'actor': actor_name,
               'seed': int(seed), 'scene': scene_spec, 'metadata': metadata,
               'frames': frames, 'actions': actions, 'executed_actions': executed,
+              'frame_action_indices': frame_action_indices,
               'summary': summary}
     if constrained:
         record.update(raw_policy_actions=raw_policy_actions,

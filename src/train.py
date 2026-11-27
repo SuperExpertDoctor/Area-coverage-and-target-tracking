@@ -6,7 +6,8 @@ grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128, device='cpu',
 num_threads=1, model_config=None, metadata=None, normalize_vectors=True,
 normalization_min_std=.1, initial_checkpoint=None,
 correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
-split_reference_checkpoint=None, field_steering_loss_weight=0.)``
+split_reference_checkpoint=None, field_steering_loss_weight=0., progress_every=50,
+progress_seconds=30., load_workers=0, resume_checkpoint=None)``
 
 An episode begins with zero hidden state. Its contiguous TBPTT chunks carry
 ``hidden.detach()``. Episodes, never individual fragments, are shuffled. Loss is
@@ -21,8 +22,14 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
 import random
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from functools import wraps
 
 import numpy as np
 import torch
@@ -158,7 +165,8 @@ def _field_steering_loss(predicted, target, vector):
 
 def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=None,
                grad_clip=1., order=None, correction_weight_max=1., correction_threshold=.1,
-               field_steering_loss_weight=0.):
+               field_steering_loss_weight=0., load_workers=0, progress_callback=None,
+               progress_every=50, progress_seconds=30.):
     """Encode map chunks only, carrying causal state across contiguous chunks."""
     training = optimizer is not None
     if not math.isfinite(field_steering_loss_weight) or field_steering_loss_weight<0:
@@ -171,8 +179,37 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
     objective_sum = objective_weight_sum = 0.
     valid_steps = 0
     valid_components = 0
+    started = last_progress = time.perf_counter()
+    data_load_seconds = 0.
+    chunks_processed = 0
+    gradient_norm = None
+
+    def report(phase, episodes_completed):
+        nonlocal last_progress
+        if progress_callback is None:
+            return
+        last_progress = time.perf_counter()
+        metrics = (dict(loss=objective_sum / objective_weight_sum,
+                        action_mse=squared_sum / valid_components,
+                        action_mae=absolute_sum / valid_components, steps=valid_steps)
+                   if valid_steps else None)
+        progress_callback(dict(phase=phase, chunks=chunks_processed, processed_steps=valid_steps,
+                               episodes_completed=episodes_completed, episodes_total=len(indices),
+                               metrics=metrics, elapsed_seconds=last_progress-started,
+                               data_load_seconds=data_load_seconds, gradient_norm=gradient_norm))
+
     for offset in range(0, len(indices), batch_size):
-        episodes = [dataset[index] for index in indices[offset:offset + batch_size]]
+        report("loading", offset)
+        load_started = time.perf_counter()
+        batch_indices = indices[offset:offset + batch_size]
+        if load_workers:
+            # Only the current episode batch is live. Threads decompress separate
+            # NPZ files; ordered map preserves all existing padding/GRU semantics.
+            with ThreadPoolExecutor(max_workers=min(load_workers, len(batch_indices))) as pool:
+                episodes = list(pool.map(dataset.__getitem__, batch_indices))
+        else:
+            episodes = [dataset[index] for index in batch_indices]
+        data_load_seconds += time.perf_counter() - load_started
         maximum = max(len(episode["actions"]) for episode in episodes)
         hidden = None
         for start in range(0, maximum, sequence_length):
@@ -185,6 +222,8 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                             if key not in {"actions", "mask"}}
             with torch.set_grad_enabled(training):
                 predicted, hidden = model(observations, hidden)
+                if not torch.isfinite(predicted).all():
+                    raise FloatingPointError("nonfinite policy prediction")
                 mask = batch["mask"].unsqueeze(-1)
                 error = predicted - batch["actions"]
                 square = (error.square() * mask).sum()
@@ -213,10 +252,13 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                     objective=(per_step*batch['mask']).sum() if field_steering_loss_weight else square
                     weight_count=step_count
                     loss = objective / step_count
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("nonfinite training loss" if training else "nonfinite evaluation loss")
                 if training:
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip, error_if_nonfinite=True)
+                    gradient_norm = float(norm.detach().item())
                     optimizer.step()
             hidden = hidden.detach()
             squared_sum += float(square.detach().item())
@@ -225,6 +267,15 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
             objective_weight_sum += float(weight_count.detach().item() if torch.is_tensor(weight_count) else weight_count)
             valid_steps += step_count
             valid_components += step_count * error.shape[-1]
+            chunks_processed += 1
+            if (chunks_processed % progress_every == 0 or
+                    time.perf_counter() - last_progress >= progress_seconds or
+                    (offset + batch_size >= len(indices) and start + sequence_length >= maximum)):
+                report("chunks", offset + sum(len(episode["actions"]) <= start + sequence_length
+                                               for episode in episodes))
+        # Sliced chunks retain the full backing storage. Release them before the
+        # next batch decompresses, avoiding two resident episode batches.
+        del chunks, episodes
     if valid_steps == 0:
         raise ValueError("dataset contains no usable action steps")
     return dict(loss=objective_sum / objective_weight_sum,
@@ -232,8 +283,80 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                 action_mae=absolute_sum / valid_components, steps=valid_steps)
 
 
+def _atomic_write(path, write):
+    """Publish a complete same-filesystem file, retaining the old file on failure."""
+    path = Path(path)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            write(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(8):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                # Windows readers can briefly deny delete/rename sharing. Keep
+                # the prior snapshot intact; never fall back to in-place writes.
+                if attempt == 7:
+                    raise
+                time.sleep(.01 * 2 ** attempt)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _atomic_torch_save(path, value):
+    _atomic_write(path, lambda stream: torch.save(value, stream))
+
+
 def _write_json(path, value):
-    Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    encoded = json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    _atomic_write(path, lambda stream: stream.write(encoded))
+
+
+def _capture_rng_state(shuffle_rng):
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                shuffle=shuffle_rng.bit_generator.state)
+
+
+def _restore_rng_state(state, shuffle_rng):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"]:
+        if not torch.cuda.is_available() or len(state["cuda"]) != torch.cuda.device_count():
+            raise ValueError("exact resume requires the same CUDA device topology")
+        torch.cuda.set_rng_state_all(state["cuda"])
+    shuffle_rng.bit_generator.state = state["shuffle"]
+
+
+def _dataset_identity(paths):
+    """Hash compressed bytes in bounded buffers; never load a full dataset."""
+    result = []
+    for path in sorted(map(Path, paths)):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        result.append(dict(path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest.hexdigest()))
+    return result
+
+
+def _runtime_configuration():
+    return dict(torch=str(torch.__version__), numpy=np.__version__, cuda=torch.version.cuda,
+                cuda_devices=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+                cudnn=torch.backends.cudnn.version(),
+                cudnn_deterministic=torch.backends.cudnn.deterministic,
+                cudnn_benchmark=torch.backends.cudnn.benchmark,
+                cudnn_allow_tf32=torch.backends.cudnn.allow_tf32,
+                matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
+                float32_matmul_precision=torch.get_float32_matmul_precision(),
+                default_dtype=str(torch.get_default_dtype()),
+                deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
+                deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
+                cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"))
 
 
 def _preserve_scene_assignments(split, previous, validation_fraction, seed):
@@ -313,13 +436,35 @@ def _preserve_scene_assignments(split, previous, validation_fraction, seed):
     return result
 
 
+def _record_training_failure(function):
+    @wraps(function)
+    def guarded(task, dataset_dir, output_dir, tf_log_dir, **kwargs):
+        try:
+            return function(task, dataset_dir, output_dir, tf_log_dir, **kwargs)
+        except Exception as error:
+            path = Path(output_dir) / "training-status.json"
+            if path.is_file():
+                try:
+                    status = json.loads(path.read_text(encoding="utf-8"))
+                    status.update(state="failed", error=f"{type(error).__name__}: {error}",
+                                  updated_at=datetime.now(timezone.utc).isoformat())
+                    _write_json(path, status)
+                except (OSError, ValueError, TypeError):
+                    # The original training/storage failure remains authoritative.
+                    pass
+            raise
+    return guarded
+
+
+@_record_training_failure
 def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch_size=32,
                  sequence_length=32, learning_rate=3e-4, weight_decay=1e-5,
                  grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128,
                  device="cpu", num_threads=1, model_config=None, metadata=None,
                  normalize_vectors=True, normalization_min_std=.1, initial_checkpoint=None,
                  correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
-                 split_reference_checkpoint=None, field_steering_loss_weight=0.):
+                 split_reference_checkpoint=None, field_steering_loss_weight=0.,
+                 progress_every=50, progress_seconds=30., load_workers=0, resume_checkpoint=None):
     """Train one task, write six meaningful TensorBoard metrics and best/last files.
 
     ``model_config`` accepts ``vector_dim``, ``hidden_size`` and
@@ -370,6 +515,22 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     Raw three-component Action_MSE/MAE and original labels remain unchanged.
     The default zero preserves the previous loss arithmetic exactly.
 
+    load_workers decompresses only the current episode batch with bounded
+    threads. training-status.json updates after progress_every chunks or
+    progress_seconds, including epoch-zero baselines. history.json and legacy
+    training_history.json update atomically each completed epoch.
+    resume_checkpoint restores a new-format last.pt at its completed epoch
+    boundary: Adam, all RNGs, split, normalization and history. Dataset bytes,
+    numerical settings and CUDA topology must agree. epochs is the final target,
+    not an additional count. TensorBoard purges events after the restored epoch.
+    last.pt embeds the verified best artifact so a crash between best/last
+    replacements can recover their consistent pair. initial_checkpoint remains
+    an optimizer-reset warm start; interrupted chunks are not resumable.
+    Runtime precision/determinism flags are checked. Bitwise CUDA continuation
+    also requires deterministic kernels and a compatible cuBLAS workspace set
+    before CUDA initialization; ordinary CUDA kernels can differ by roundoff
+    despite restoration of the exact training state.
+
     Returns JSON-safe initial/best validation MSE, initial validation metrics,
     checkpoint paths, history (epoch/Train/Validation), split and train config.
     The initial checkpoint is a candidate for best, so a worsening run preserves
@@ -377,9 +538,15 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     """
     for name, value in [("epochs", epochs), ("batch_size", batch_size),
                         ("sequence_length", sequence_length), ("hidden_size", hidden_size),
-                        ("num_threads", num_threads)]:
+                        ("num_threads", num_threads), ("progress_every", progress_every)]:
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(load_workers, int) or isinstance(load_workers, bool) or load_workers < 0:
+        raise ValueError("load_workers must be a nonnegative integer")
+    if not math.isfinite(progress_seconds) or progress_seconds <= 0:
+        raise ValueError("progress_seconds must be positive and finite")
+    if resume_checkpoint is not None and (initial_checkpoint is not None or split_reference_checkpoint is not None):
+        raise ValueError("resume_checkpoint, initial_checkpoint and split_reference_checkpoint are mutually exclusive")
     for name, value, minimum, strict in [("learning_rate", learning_rate, 0, True),
                                         ("weight_decay", weight_decay, 0, False),
                                         ("normalization_min_std", normalization_min_std, 0, False),
@@ -401,12 +568,26 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     output_dir, tf_log_dir = Path(output_dir), Path(tf_log_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     tf_log_dir.mkdir(parents=True, exist_ok=True)
+    run_started = time.perf_counter()
+    status = dict(task=task, pid=os.getpid(), state="running", phase="preparing", epoch=0,
+                  epochs=epochs, processed_steps=0, chunks=0, validation_available=None,
+                  train_metrics=None, validation_metrics=None)
+
+    def publish_status(**values):
+        status.update(values)
+        status.update(updated_at=datetime.now(timezone.utc).isoformat(),
+                      run_elapsed_seconds=time.perf_counter()-run_started)
+        _write_json(output_dir / "training-status.json", status)
+
+    publish_status()
+    runtime_configuration = _runtime_configuration()
     initial_state = None
     initial_path = None
     initial_requested_path = None
     initial_sha256 = None
-    if initial_checkpoint is not None:
-        initial_requested_path = Path(initial_checkpoint).resolve()
+    resume_state = resume_payload = resume_path = None
+    if initial_checkpoint is not None or resume_checkpoint is not None:
+        initial_requested_path = Path(initial_checkpoint if initial_checkpoint is not None else resume_checkpoint).resolve()
         if not initial_requested_path.is_file():
             raise ValueError(f"initial checkpoint is missing: {initial_requested_path}")
         initial_bytes = initial_requested_path.read_bytes()
@@ -434,14 +615,24 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                 continue
             if key not in options or options[key] != value:
                 raise ValueError(f"initial checkpoint model config mismatch for {key}")
-        initial_path = (output_dir / "initial-checkpoints" / f"{initial_sha256}.pt").resolve()
-        initial_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with initial_path.open("xb") as snapshot:
-                snapshot.write(initial_bytes)
-        except FileExistsError:
-            if hashlib.sha256(initial_path.read_bytes()).hexdigest() != initial_sha256:
-                raise ValueError("immutable input checkpoint snapshot has been modified")
+        if resume_checkpoint is not None:
+            resume_path, resume_state = initial_requested_path, initial_state
+            resume_payload = resume_state.get("resume_state")
+            if (not isinstance(resume_payload, dict) or resume_payload.get("version") != 1 or
+                    resume_payload.get("checkpoint_role") != "last"):
+                raise ValueError("exact resume requires a new-format last checkpoint with optimizer/RNG/history state")
+            if epochs < resume_state["epoch"]:
+                raise ValueError("epochs must reach or exceed the exact resume checkpoint epoch")
+            initial_requested_path = initial_state = initial_sha256 = None
+        else:
+            initial_path = (output_dir / "initial-checkpoints" / f"{initial_sha256}.pt").resolve()
+            initial_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with initial_path.open("xb") as snapshot:
+                    snapshot.write(initial_bytes)
+            except FileExistsError:
+                if hashlib.sha256(initial_path.read_bytes()).hexdigest() != initial_sha256:
+                    raise ValueError("immutable input checkpoint snapshot has been modified")
     else:
         options = dict(hidden_size=hidden_size)
         options.update(model_config or {})
@@ -472,9 +663,16 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         reference_snapshot.parent.mkdir(parents=True, exist_ok=True)
         _write_json(reference_snapshot, dict(checkpoint=str(reference_path), sha256=reference_sha256,
                                             dataset_split=reference_split))
-    split = split_episodes(dataset_dir, task, validation_fraction=0 if initial_state is not None or reference_split is not None else validation_fraction,
+    split = split_episodes(dataset_dir, task, validation_fraction=0 if initial_state is not None or reference_split is not None or resume_state is not None else validation_fraction,
                            seed=seed, observation_schema=observation_schema)
-    if initial_state is not None:
+    dataset_identity = _dataset_identity(record["path"] for record in split["episodes"])
+    if resume_state is not None:
+        saved_split = resume_state["dataset_split"]
+        if (split["episodes"] != saved_split["episodes"] or
+                dataset_identity != resume_payload["dataset_identity"]):
+            raise ValueError("exact resume dataset bytes, paths or scene metadata have changed")
+        split = saved_split
+    elif initial_state is not None:
         if not 0 <= validation_fraction < 1:
             raise ValueError("validation_fraction must be in [0,1)")
         split = _preserve_scene_assignments(split, initial_state.get("dataset_split"), validation_fraction, seed)
@@ -484,11 +682,14 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         split = _preserve_scene_assignments(split, reference_split, validation_fraction, seed)
     train_dataset = SequenceDataset(split["train_paths"], task=task, observation_schema=observation_schema)
     validation_dataset = SequenceDataset(split["validation_paths"], task=task, observation_schema=observation_schema)
+    publish_status(validation_available=bool(len(validation_dataset)), phase="normalization")
     training_order, sampling_report = _training_sample_order(train_dataset, dagger_recovery_min_steps)
     model = create_policy(task, options).to(target_device)
     if model.vector_dim != train_dataset.vector_dim:
         raise ValueError("model vector dimension does not match the task observation schema")
-    if initial_state is not None:
+    if resume_state is not None:
+        model.load_state_dict(resume_state["model_state_dict"])
+    elif initial_state is not None:
         try:
             model.load_state_dict(initial_state["model_state_dict"])
         except RuntimeError as error:
@@ -518,6 +719,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     train_config["correction_threshold"] = float(correction_threshold)
     train_config["dagger_recovery_min_steps"] = int(dagger_recovery_min_steps)
     train_config["field_steering_loss_weight"] = float(field_steering_loss_weight)
+    train_config.update(progress_every=progress_every, progress_seconds=float(progress_seconds), load_workers=load_workers)
     train_config["training_sampling"] = sampling_report
     loss_definition = dict(
         training=("sum(valid * weight * squared_world_xy_and_normalized_pan_error) / sum(valid * weight)"
@@ -571,19 +773,89 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                              source_checkpoint_sha256=initial_sha256,
                              source_fit_subset=saved_normalization.get("fit_subset"),
                              normalization_refitted=False)
+    if resume_state is not None:
+        saved_config = resume_state["train_config"]
+        exact_keys = ["batch_size", "sequence_length", "learning_rate", "weight_decay", "grad_clip",
+                      "validation_fraction", "seed", "hidden_size", "device", "num_threads", "normalize_vectors",
+                      "normalization_min_std", "correction_weight_max", "correction_threshold",
+                      "dagger_recovery_min_steps", "field_steering_loss_weight", "training_sampling", "loss_definition"]
+        for key in exact_keys:
+            if train_config[key] != saved_config[key]:
+                raise ValueError(f"exact resume training config mismatch for {key}")
+        if resume_payload.get("torch_version") != str(torch.__version__):
+            raise ValueError("exact resume requires the same PyTorch version")
+        if resume_payload.get("runtime_configuration") != runtime_configuration:
+            raise ValueError("exact resume runtime precision/determinism configuration has changed")
+        if metadata is not None and metadata != resume_state.get("metadata", {}):
+            raise ValueError("exact resume metadata/config has changed")
+        metadata = resume_state.get("metadata", {})
+        for key in ["initial_checkpoint", "initial_checkpoint_sha256", "initial_checkpoint_requested",
+                    "split_reference_checkpoint", "split_reference_checkpoint_sha256", "split_reference_snapshot"]:
+            train_config[key] = saved_config.get(key)
+        normalization = resume_state["normalization"]
+        optimizer.load_state_dict(resume_state["optimizer_state_dict"])
     dataset_metadata = read_episode_metadata(train_dataset.paths[0])
     best_path, last_path = output_dir / "best.pt", output_dir / "last.pt"
+    export_path = output_dir / f"{task}_policy.pt"
+    rng = np.random.default_rng(seed)
     history = []
-    initial_validation = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device,
-                                    field_steering_loss_weight=field_steering_loss_weight)
-                          if len(validation_dataset) else None)
-    initial_train = _run_epoch(model, train_dataset, batch_size, sequence_length, target_device,
-                               field_steering_loss_weight=field_steering_loss_weight)
-    best_mse = (initial_validation or initial_train)["action_mse"]
-    best_epoch = 0
+
+    def run_phase(phase, epoch, dataset, **kwargs):
+        publish_status(phase=phase, epoch=epoch, chunks=0, processed_steps=0,
+                       episodes_completed=0, episodes_total=len(dataset), metrics=None,
+                       gradient_norm=None, elapsed_seconds=0., data_load_seconds=0.)
+        def progress(event):
+            values = dict(event)
+            values["operation"] = values.pop("phase")
+            publish_status(phase=phase, epoch=epoch, **values)
+        try:
+            return _run_epoch(model, dataset, batch_size, sequence_length, target_device,
+                              field_steering_loss_weight=field_steering_loss_weight,
+                              load_workers=load_workers, progress_callback=progress,
+                              progress_every=progress_every, progress_seconds=progress_seconds, **kwargs)
+        except Exception as error:
+            publish_status(state="failed", error=f"{type(error).__name__}: {error}")
+            raise
+
+    if resume_state is None:
+        initial_validation = (run_phase("initial_validation", 0, validation_dataset)
+                              if len(validation_dataset) else None)
+        initial_train = run_phase("initial_train", 0, train_dataset)
+        best_mse = (initial_validation or initial_train)["action_mse"]
+        best_epoch = start_epoch = 0
+    else:
+        initial_validation = resume_payload["initial_validation"]
+        initial_train = resume_payload["initial_train"]
+        history = resume_payload["history"]
+        best_mse, best_epoch = resume_payload["best_selection_mse"], resume_payload["best_epoch"]
+        start_epoch = resume_state["epoch"]
+        if [entry["epoch"] for entry in history] != list(range(1, start_epoch + 1)):
+            raise ValueError("exact resume checkpoint history is incomplete")
+        best_bytes = resume_payload["best_checkpoint_bytes"]
+        if hashlib.sha256(best_bytes).hexdigest() != resume_payload["best_checkpoint_sha256"]:
+            raise ValueError("exact resume embedded best checkpoint SHA256 is invalid")
+        if not best_path.is_file() or best_path.read_bytes() != best_bytes:
+            _atomic_write(best_path, lambda stream: stream.write(best_bytes))
+
+    publish_status(epoch=start_epoch,
+                   train_metrics=history[-1]["Train"] if history else initial_train,
+                   validation_metrics=history[-1]["Validation"] if history else initial_validation)
+
+    origin_checkpoint = (resume_state.get("initial_checkpoint") if resume_state is not None
+                         else None if initial_path is None else str(initial_path))
+    origin_sha256 = (resume_state.get("initial_checkpoint_sha256") if resume_state is not None else initial_sha256)
 
     def save_checkpoint(path, epoch, train_metrics, validation_metrics, selection_metrics=None):
-        torch.save(dict(checkpoint_version="bc-field-v2" if field_mode else "bc-v1",
+        best_bytes = best_path.read_bytes() if path == last_path else None
+        resumable = dict(version=1, checkpoint_role="last" if path == last_path else "best",
+                         torch_version=str(torch.__version__), rng=_capture_rng_state(rng),
+                         runtime_configuration=runtime_configuration,
+                         dataset_identity=dataset_identity, history=history,
+                         initial_train=initial_train, initial_validation=initial_validation,
+                         best_selection_mse=best_mse, best_epoch=best_epoch,
+                         best_checkpoint_sha256=hashlib.sha256(best_bytes).hexdigest() if best_bytes else None,
+                         best_checkpoint_bytes=best_bytes)
+        _atomic_torch_save(path, dict(checkpoint_version="bc-field-v2" if field_mode else "bc-v1",
                         observation_schema=observation_schema, action_schema=action_schema, task=task,
                         model_config=model.model_config, model_state_dict=model.state_dict(),
                         optimizer_state_dict=optimizer.state_dict(), epoch=epoch, seed=int(seed),
@@ -594,14 +866,31 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                         validation_metrics=validation_metrics,
                         selection_metrics=selection_metrics or validation_metrics or train_metrics,
                         selection_subset="validation_unique" if len(validation_dataset) else "train_unique",
-                        initial_checkpoint=None if initial_path is None else str(initial_path),
-                        initial_checkpoint_sha256=initial_sha256,
-                        initial_checkpoint_epoch=None if initial_state is None else initial_state.get("epoch"),
-                        architecture_conversion=None if initial_state is None else initial_state.get("architecture_conversion")), path)
+                        initial_checkpoint=origin_checkpoint, initial_checkpoint_sha256=origin_sha256,
+                        initial_checkpoint_epoch=(resume_state.get("initial_checkpoint_epoch") if resume_state is not None
+                                                  else None if initial_state is None else initial_state.get("epoch")),
+                        architecture_conversion=(resume_state.get("architecture_conversion") if resume_state is not None
+                                                 else None if initial_state is None else initial_state.get("architecture_conversion")),
+                        resume_state=resumable))
 
-    save_checkpoint(best_path, 0, initial_train, initial_validation)
-    rng = np.random.default_rng(seed)
-    with SummaryWriter(log_dir=str(tf_log_dir)) as writer:
+    def write_history():
+        result = dict(task=task,
+                      initial_validation_mse=None if initial_validation is None else initial_validation["action_mse"],
+                      best_validation_mse=None if initial_validation is None else best_mse,
+                      initial_validation=initial_validation, initial_train=initial_train,
+                      best_selection_mse=best_mse, best_epoch=best_epoch,
+                      best_checkpoint=str(best_path.resolve()), last_checkpoint=str(last_path.resolve()),
+                      exported_checkpoint=str(export_path.resolve()), history=history, split=split,
+                      train_config=train_config, model_config=model.model_config,
+                      loss_definition=loss_definition, initial_checkpoint=origin_checkpoint,
+                      initial_checkpoint_sha256=origin_sha256,
+                      resume_checkpoint=None if resume_path is None else str(resume_path),
+                      validation_available=initial_validation is not None)
+        _write_json(output_dir / "history.json", result)
+        _write_json(output_dir / "training_history.json", result)
+        return result
+
+    with SummaryWriter(log_dir=str(tf_log_dir), purge_step=start_epoch + 1 if resume_state is not None else None) as writer:
         def log_metrics(subset, metrics, epoch):
             for tag, key in [("Loss", "loss"), ("Action_MSE", "action_mse"), ("Action_MAE", "action_mae")]:
                 writer.add_scalar(f"{subset}/{tag}", metrics[key], epoch)
@@ -612,50 +901,53 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
             print(f"[{task}] epoch={epoch}/{epochs} train_loss={train_metrics['loss']:.8g} "
                   f"val_loss={val_loss} val_mse={val_mse}", flush=True)
 
-        log_metrics("Train", initial_train, 0)
-        if initial_validation is not None:
-            log_metrics("Validation", initial_validation, 0)
-        print_progress(0, initial_train, initial_validation)
-        for epoch in range(1, epochs + 1):
+        if resume_state is None:
+            log_metrics("Train", initial_train, 0)
+            if initial_validation is not None:
+                log_metrics("Validation", initial_validation, 0)
+            writer.flush()
+            save_checkpoint(best_path, 0, initial_train, initial_validation)
+            save_checkpoint(last_path, 0, initial_train, initial_validation)
+            print_progress(0, initial_train, initial_validation)
+        else:
+            _restore_rng_state(resume_payload["rng"], rng)
+            if last_path.resolve() != resume_path.resolve():
+                resume_bytes = resume_path.read_bytes()
+                _atomic_write(last_path, lambda stream: stream.write(resume_bytes))
+        write_history()
+        for epoch in range(start_epoch + 1, epochs + 1):
             order = rng.permutation(training_order).tolist()
-            train_metrics = _run_epoch(model, train_dataset, batch_size, sequence_length,
-                                       target_device, optimizer=optimizer, grad_clip=grad_clip, order=order,
-                                       correction_weight_max=correction_weight_max,
-                                       correction_threshold=correction_threshold,
-                                       field_steering_loss_weight=field_steering_loss_weight)
-            validation_metrics = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device,
-                                            field_steering_loss_weight=field_steering_loss_weight)
+            train_metrics = run_phase("train", epoch, train_dataset, optimizer=optimizer,
+                                      grad_clip=grad_clip, order=order,
+                                      correction_weight_max=correction_weight_max,
+                                      correction_threshold=correction_threshold)
+            publish_status(train_metrics=train_metrics)
+            validation_metrics = (run_phase("validation", epoch, validation_dataset)
                                   if len(validation_dataset) else None)
             selection_metrics = validation_metrics
             if selection_metrics is None:
-                selection_metrics = (_run_epoch(model, train_dataset, batch_size, sequence_length, target_device,
-                                               field_steering_loss_weight=field_steering_loss_weight)
+                selection_metrics = (run_phase("selection", epoch, train_dataset)
                                      if len(training_order) > len(train_dataset) else train_metrics)
+            history.append(dict(epoch=epoch, Train=train_metrics, Validation=validation_metrics))
             score = selection_metrics["action_mse"]
             if score < best_mse:
                 best_mse, best_epoch = score, epoch
                 save_checkpoint(best_path, epoch, train_metrics, validation_metrics, selection_metrics)
-            save_checkpoint(last_path, epoch, train_metrics, validation_metrics, selection_metrics)
             log_metrics("Train", train_metrics, epoch)
             if validation_metrics is not None:
                 log_metrics("Validation", validation_metrics, epoch)
-            history.append(dict(epoch=epoch, Train=train_metrics, Validation=validation_metrics))
             writer.flush()
+            save_checkpoint(last_path, epoch, train_metrics, validation_metrics, selection_metrics)
+            write_history()
+            publish_status(phase="epoch_complete", epoch=epoch, train_metrics=train_metrics,
+                           validation_metrics=validation_metrics, best_epoch=best_epoch,
+                           best_selection_mse=best_mse)
             print_progress(epoch, train_metrics, validation_metrics)
     # A task-named export is a full checkpoint with schema and normalization.
-    export_path = output_dir / f"{task}_policy.pt"
-    export_path.write_bytes(best_path.read_bytes())
-    result = dict(task=task,
-                  initial_validation_mse=None if initial_validation is None else initial_validation["action_mse"],
-                  best_validation_mse=None if initial_validation is None else best_mse,
-                  initial_validation=initial_validation, initial_train=initial_train,
-                  best_selection_mse=best_mse, best_epoch=best_epoch,
-                  best_checkpoint=str(best_path.resolve()), last_checkpoint=str(last_path.resolve()),
-                  exported_checkpoint=str(export_path.resolve()), history=history, split=split,
-                  train_config=train_config, model_config=model.model_config,
-                  loss_definition=loss_definition,
-                  initial_checkpoint=None if initial_path is None else str(initial_path),
-                  initial_checkpoint_sha256=initial_sha256,
-                  validation_available=initial_validation is not None)
-    _write_json(output_dir / "training_history.json", result)
+    export_bytes = best_path.read_bytes()
+    _atomic_write(export_path, lambda stream: stream.write(export_bytes))
+    result = write_history()
+    publish_status(state="complete", phase="complete", epoch=epochs,
+                   train_metrics=history[-1]["Train"] if history else initial_train,
+                   validation_metrics=history[-1]["Validation"] if history else initial_validation)
     return result

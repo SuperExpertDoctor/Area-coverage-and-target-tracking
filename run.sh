@@ -1,22 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # All tunable simulation, expert, training and export values live in this entry.
-# Usage: bash run.sh [all|expert|expert-validate|collect|train|dagger|evaluate|serve] [extra main.py flags]
+# Usage: bash run.sh [formal|all|expert|expert-validate|collect|train|dagger|evaluate|serve] [extra main.py flags]
 # SIM_CONFIG.potential_enabled selects the protocol; --potential-field / --no-potential-field explicitly override it.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 PYTHON="${PYTHON:-python}"
-MODE="${1:-all}"
+MODE="${1:-formal}"
 if (($#)); then shift; fi
-OUTPUT_DIR="outputs/field-v2"
-TF_LOG_DIR="tf-logs/field-v2"
-RUN_NAME="$(date +%Y%m%d-%H%M%S)"
+OUTPUT_DIR="outputs/formal"
+TF_LOG_DIR="tf-logs/formal"
+RUN_NAME="formal-1000"
 # Optional explicit inputs. Empty strings use the task's standard output paths.
 CHECKPOINT_PATH=""
 SPLIT_REFERENCE_CHECKPOINT=""
+RESUME_CHECKPOINT=""
 DATASET_MANIFEST=""
 export PYTHONPYCACHEPREFIX="outputs/cache/python"
 export MPLCONFIGDIR="outputs/cache/matplotlib"
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+export PYTHONUNBUFFERED=1
+# Set before NumPy loads in the parent or spawned workers; training sets its
+# separate explicit PyTorch --num-threads budget below.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 SIM_CONFIG=$(cat <<'JSON'
 {
   "world_bounds": [
@@ -194,6 +204,7 @@ JSON
 INPUT_ARGS=()
 if [[ -n "$CHECKPOINT_PATH" ]]; then INPUT_ARGS+=(--checkpoint-path "$CHECKPOINT_PATH"); fi
 if [[ -n "$SPLIT_REFERENCE_CHECKPOINT" ]]; then INPUT_ARGS+=(--split-reference-checkpoint "$SPLIT_REFERENCE_CHECKPOINT"); fi
+if [[ -n "$RESUME_CHECKPOINT" ]]; then INPUT_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT"); fi
 if [[ -n "$DATASET_MANIFEST" ]]; then INPUT_ARGS+=(--dataset-manifest "$DATASET_MANIFEST"); fi
 exec "$PYTHON" main.py \
   --mode "$MODE" --task both \
@@ -203,16 +214,22 @@ exec "$PYTHON" main.py \
   --visualize --open-browser --keep-server --host 127.0.0.1 --port 8787 \
   --render-every 5 --realtime-factor 0 --progress-every 300 \
   --expert-seed 7100 --collection-seed 12000 \
-  --episodes 8 --collection-attempt-multiplier 3 \
-  --collection-coverage-seconds 7200 --collection-tracking-seconds 1800 \
-  --epochs 40 --batch-size 4 --sequence-length 256 \
+  --episodes 1000 --collection-attempt-multiplier 3 \
+  --collection-workers 8 --collection-replay-every 60 --collection-resume --collection-require-task-success \
+  --collection-coverage-seconds 10800 --collection-tracking-seconds 1800 \
+  --epochs 20 --batch-size 16 --sequence-length 128 \
   --learning-rate 0.0003 --weight-decay 0.00001 --grad-clip 1 \
-  --validation-fraction 0.25 --training-seed 42 \
+  --validation-fraction 0.2 --training-seed 42 \
+  --training-progress-every 50 --training-progress-seconds 30 --training-load-workers 4 \
   --hidden-size 128 --heading-residual --action-frame body --feature-frame auto --normalize-vectors --normalization-min-std 0.1 \
-  --correction-weight-max 4 --correction-threshold 0.1 --field-steering-loss-weight 0 --dagger-recovery-min-steps 7200 \
+  --correction-weight-max 1 --correction-threshold 0.1 --field-steering-loss-weight 0 --dagger-recovery-min-steps 0 \
   --policy-safety-layer none --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
   --no-coverage-mask-previous-command \
-  --device auto --inference-device cpu --num-threads 1 \
+  --device auto --inference-device cpu --num-threads 4 --inference-num-threads 1 \
+  --formal-test-episodes 8 --formal-test-seed 960000 --formal-test-workers 4 --formal-test-replay-every 60 \
+  --formal-coverage-safety-layer forecast --formal-monitor-seconds 30 --formal-resume \
+  --browser-recording --recording-headless --recording-fps 24 --recording-width 1440 --recording-height 900 \
+  --recording-duration-seconds 30 --recording-bitrate 8000000 --recording-max-bytes 268435456 --recording-max-seconds 600 \
   --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-initial-pan-jitter 0 --dagger-max-steps 0 --no-dagger-collect-only \
   --validation-coverage-seeds 2000 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 3014 3015 3016 3017 3018 3019 3020 3021 3022 3023 3024 3025 3026 3027 3028 \
   --validation-boundary-seeds 4000 4001 4002 --validation-boundary-starts 8 \

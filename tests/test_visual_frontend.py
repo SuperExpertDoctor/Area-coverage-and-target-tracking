@@ -221,3 +221,22 @@ def test_local_import_and_catalog_refresh_keep_constraint_disclosure():
       await execute('refreshCatalog(false)');
       assert(elements.get('replay-select').children[0].textContent.includes('行为克隆网络 + 显式物理约束'));
     """)
+
+
+def test_recording_mime_detection_and_real_timeline_endpoints():
+    script = """
+      import assert from 'node:assert/strict';
+      import {recordingMime, timelineTime, replayProvenance} from './visual/recording.js';
+      assert.equal(recordingMime({isTypeSupported:t=>t==='video/webm;codecs=vp8'}),'video/webm;codecs=vp8');
+      assert.throws(()=>recordingMime({isTypeSupported:()=>false}),/recording format/i);
+      assert.equal(timelineTime(0,30,0,10800,24),0);
+      assert.equal(timelineTime(30-1/24,30,0,10800,24),10800);
+      assert.equal(timelineTime(45,30,0,1800,24),1800);
+      const provenance=replayProvenance({task:'coverage',actor:'policy',metadata:{model_sha256:'abc',control_mode:'forecast_constraint'},summary:{terminated:true,termination_reason:'collision'},frames:[{t:0},{t:123}]});
+      assert.equal(provenance.control_mode,'forecast_constraint');
+      assert.equal(provenance.simulation_end_seconds,123);
+      assert.equal(provenance.outcome.termination_reason,'collision');
+    """
+    result = subprocess.run([NODE, '--input-type=module', '-e', script], cwd=ROOT,
+                            capture_output=True, text=True, encoding='utf-8', timeout=15)
+    assert result.returncode == 0, result.stderr

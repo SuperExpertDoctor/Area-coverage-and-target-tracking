@@ -1,4 +1,4 @@
-"""Read-only local static server and bounded Server-Sent Events broadcast.
+"""Local static server, bounded recording uploads and SSE broadcast.
 
 The simulation owns all numerical state. This module only transports published
 scene/frame dictionaries and serves recorded JSON replays and frontend assets.
@@ -14,8 +14,15 @@ import os
 from pathlib import Path
 import queue
 import socket
+import subprocess
 import threading
+import tempfile
 from urllib.parse import quote, unquote, urlsplit
+
+try:
+    from .browser_recording import recording_configuration, transcode_recording
+except ImportError:  # main.py also supports the existing top-level src imports.
+    from browser_recording import recording_configuration, transcode_recording
 
 
 class _ExclusiveHTTPServer(ThreadingHTTPServer):
@@ -44,13 +51,15 @@ class VisualServer:
     A bare frame dictionary is also accepted. ``close`` is idempotent.
     """
 
-    def __init__(self, project_root, output_dir, host="127.0.0.1", port=8787, visual_config=None):
+    def __init__(self, project_root, output_dir, host="127.0.0.1", port=8787, visual_config=None, *, recording_config=None):
         self.project_root = Path(project_root).resolve()
         self.output_dir = Path(output_dir).resolve()
         self.host = host
         self.port = int(port)
         self.visual_config = {key:value for key,value in (visual_config or {}).items()
                               if key.startswith('visual_')}
+        self.recording_config = recording_configuration(recording_config)
+        self._recording_slot = threading.BoundedSemaphore(1)
         self._lock = threading.RLock()
         self._clients = set()
         self._scene = None
@@ -92,6 +101,80 @@ class VisualServer:
             def do_HEAD(self):
                 self._serve(True)
 
+            def _json(self, status, value):
+                data = json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8')
+                self._headers(status, 'application/json; charset=utf-8', len(data))
+                self.wfile.write(data)
+
+            def do_POST(self):
+                if urlsplit(self.path).path != '/api/recordings':
+                    self.close_connection = True
+                    self._json(405, {'error': 'Only POST /api/recordings is supported'})
+                    return
+                # This local application accepts uploads only from its own UI.
+                origin = self.headers.get('Origin')
+                if origin and urlsplit(origin).netloc != self.headers.get('Host'):
+                    self.close_connection = True
+                    self._json(403, {'error': 'Recording uploads must be same-origin'})
+                    return
+                try:
+                    if self.headers.get('Transfer-Encoding'):
+                        raise ValueError('Content-Length is required; chunked upload is unsupported')
+                    length = int(self.headers.get('Content-Length', '0'))
+                    if length <= 0:
+                        raise ValueError('Recording upload is empty or Content-Length is missing')
+                    if length > service.recording_config['recording_max_bytes']:
+                        self.close_connection = True
+                        self._json(413, {'error': 'Recording exceeds recording_max_bytes'})
+                        return
+                    mime = self.headers.get('Content-Type', '').split(';')[0].strip().lower()
+                    if mime not in ('video/mp4', 'video/webm'):
+                        self.close_connection = True
+                        self._json(415, {'error': 'Upload an actual video/mp4 or video/webm recording'})
+                        return
+                    raw = self.headers.get('X-Recording-Metadata', '{}')
+                    if len(raw) > 16384:
+                        raise ValueError('Recording metadata is too large')
+                    metadata = json.loads(unquote(raw))
+                    if not isinstance(metadata, dict):
+                        raise ValueError('Recording metadata must be a JSON object')
+                    json.dumps(metadata, allow_nan=False)
+                    if 'duration_seconds' in metadata:
+                        duration = float(metadata['duration_seconds'])
+                        if not 0 < duration <= service.recording_config['recording_max_seconds']:
+                            raise ValueError('Recording duration exceeds recording_max_seconds')
+                    directory = service.output_dir / 'recordings'
+                    if directory.resolve().parent != service.output_dir or directory.is_symlink():
+                        raise ValueError('Unsafe recordings directory')
+                except (ValueError, TypeError) as error:
+                    self.close_connection = True
+                    self._json(400, {'error': str(error)})
+                    return
+                if not service._recording_slot.acquire(blocking=False):
+                    self.close_connection = True
+                    self._json(429, {'error': 'A recording is already being saved; try again shortly'})
+                    return
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    self.connection.settimeout(30)
+                    with tempfile.TemporaryDirectory(prefix='.upload-', dir=directory) as temporary:
+                        source = Path(temporary) / ('capture.mp4' if mime == 'video/mp4' else 'capture.webm')
+                        remaining = length
+                        with source.open('wb') as stream:
+                            while remaining:
+                                chunk = self.rfile.read(min(65536, remaining))
+                                if not chunk:
+                                    raise ValueError('Video upload ended before Content-Length bytes arrived')
+                                stream.write(chunk)
+                                remaining -= len(chunk)
+                        record = transcode_recording(source, directory, service.recording_config, metadata)
+                    self._json(201, record)
+                except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
+                    self.close_connection = True
+                    self._json(422, {'error': str(error)})
+                finally:
+                    service._recording_slot.release()
+
             def _serve(self, head):
                 path = unquote(urlsplit(self.path).path)
                 if path == "/events" and not head:
@@ -100,6 +183,21 @@ class VisualServer:
                 if path == "/api/visual-config":
                     data=json.dumps(service.visual_config,ensure_ascii=False,allow_nan=False).encode('utf-8')
                     self._headers(200,'application/json; charset=utf-8',len(data))
+                    if not head:self.wfile.write(data)
+                    return
+                if path == '/api/recording-config':
+                    data = json.dumps(service.recording_config, allow_nan=False).encode('utf-8')
+                    self._headers(200, 'application/json; charset=utf-8', len(data))
+                    if not head:self.wfile.write(data)
+                    return
+                if path == '/api/run-status':
+                    try:
+                        status_file = service.output_dir / 'formal-status.json'
+                        run_status = json.loads(status_file.read_text(encoding='utf-8')) if status_file.is_file() else {}
+                    except (OSError, ValueError):
+                        run_status = {}
+                    data = json.dumps(run_status, ensure_ascii=False, allow_nan=False).encode('utf-8')
+                    self._headers(200, 'application/json; charset=utf-8', len(data))
                     if not head:self.wfile.write(data)
                     return
                 if path == "/api/replays":

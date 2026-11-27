@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -15,7 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'src'))
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--mode', choices=['all','expert','expert-validate','collect','train','dagger','evaluate','serve'], default='all')
+    p.add_argument('--mode', choices=['formal','all','expert','expert-validate','collect','train','dagger','evaluate','serve'], default='all')
     p.add_argument('--task', choices=['both','coverage','tracking'], default='both')
     p.add_argument('--config-json', default='{}', help='Complete SI-unit simulation/heuristic hyperparameter JSON')
     p.add_argument('--potential-field', action=argparse.BooleanOptionalAction, default=None,
@@ -59,6 +60,10 @@ def parser():
     p.add_argument('--collection-seed', type=int, default=1000)
     p.add_argument('--episodes', type=int, default=8)
     p.add_argument('--collection-attempt-multiplier', type=int, default=3)
+    p.add_argument('--collection-workers',type=int,default=1)
+    p.add_argument('--collection-replay-every',type=int,default=60)
+    p.add_argument('--collection-resume',action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument('--collection-require-task-success',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--collection-coverage-seconds', type=float, default=5400.)
     p.add_argument('--collection-tracking-seconds', type=float, default=1800.)
     p.add_argument('--epochs', type=int, default=30)
@@ -73,6 +78,7 @@ def parser():
     p.add_argument('--device', choices=['auto','cpu','cuda'], default='auto')
     p.add_argument('--inference-device',choices=['auto','cpu','cuda'],default='cpu',
                    help='Online batch-one policy device, independent of training')
+    p.add_argument('--inference-num-threads',type=int,default=1)
     p.add_argument('--num-threads', type=int, default=1)
     p.add_argument('--heading-residual', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--action-frame', choices=['body','world'], default='body')
@@ -122,6 +128,26 @@ def parser():
     p.add_argument('--validation-trajectory-every',type=float,default=60.)
     p.add_argument('--validation-coverage-ratio',type=float,default=1.)
     p.add_argument('--validation-resume',action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument('--training-progress-every',type=int,default=50)
+    p.add_argument('--training-progress-seconds',type=float,default=30.)
+    p.add_argument('--training-load-workers',type=int,default=0)
+    p.add_argument('--resume-checkpoint',type=Path,default=None)
+    p.add_argument('--recording-fps',type=int,default=24)
+    p.add_argument('--recording-width',type=int,default=1440)
+    p.add_argument('--recording-height',type=int,default=900)
+    p.add_argument('--recording-duration-seconds',type=float,default=30.)
+    p.add_argument('--recording-bitrate',type=int,default=8000000)
+    p.add_argument('--recording-max-bytes',type=int,default=268435456)
+    p.add_argument('--recording-max-seconds',type=float,default=600.)
+    p.add_argument('--browser-recording',action=argparse.BooleanOptionalAction,default=False)
+    p.add_argument('--recording-headless',action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument('--formal-test-episodes',type=int,default=8)
+    p.add_argument('--formal-test-seed',type=int,default=940000)
+    p.add_argument('--formal-test-workers',type=int,default=4)
+    p.add_argument('--formal-test-replay-every',type=int,default=60)
+    p.add_argument('--formal-coverage-safety-layer',choices=['none','forecast'],default='forecast')
+    p.add_argument('--formal-monitor-seconds',type=float,default=30.)
+    p.add_argument('--formal-resume',action=argparse.BooleanOptionalAction,default=True)
     return p
 
 
@@ -150,7 +176,7 @@ def main(argv=None):
         args.run_name=time.strftime('run-%Y%m%d-%H%M%S')
     if Path(args.run_name).name!=args.run_name or args.run_name in ['.','..']:
         raise ValueError('run-name must be one directory name')
-    if args.device=='auto' and args.mode in ['all','train','dagger','evaluate']:
+    if args.device=='auto' and args.mode in ['formal','all','train','dagger','evaluate']:
         import torch
         args.device='cuda' if torch.cuda.is_available() else 'cpu'
     if args.inference_device=='auto':
@@ -158,6 +184,19 @@ def main(argv=None):
         args.inference_device='cuda' if torch.cuda.is_available() else 'cpu'
     if args.episodes < 2 or args.epochs < 1 or args.collection_attempt_multiplier < 1:
         raise ValueError('Need at least two demonstration episodes and positive training settings')
+    if min(args.collection_workers,args.collection_replay_every,args.formal_test_workers,
+           args.formal_test_episodes,args.formal_test_replay_every,args.training_progress_every,
+           args.num_threads,args.inference_num_threads,args.batch_size,args.sequence_length,args.hidden_size)<1:
+        raise ValueError('Collection, progress and test counts must be positive')
+    if any(not math.isfinite(value) or value<=0 for value in (args.formal_monitor_seconds,
+            args.training_progress_seconds,args.learning_rate,args.grad_clip,
+            args.collection_coverage_seconds,args.collection_tracking_seconds)):
+        raise ValueError('Progress intervals must be positive')
+    if min(args.expert_seed,args.collection_seed,args.formal_test_seed)<0:
+        raise ValueError('Scene seeds must be nonnegative')
+    if args.mode=='formal' and (args.checkpoint_path or args.resume_checkpoint or args.warm_start
+                               or args.dataset_manifest or args.split_reference_checkpoint):
+        raise ValueError('Formal run owns fresh datasets and exact-resume checkpoints; external inputs are not accepted')
     if (args.checkpoint_path or args.dataset_manifest) and args.task=='both':
         raise ValueError('Explicit checkpoint/manifest requires one --task')
     if not 0<=args.dagger_beta<=1 or args.dagger_episodes<1 or args.dagger_max_steps<0 or args.dagger_iteration<1:
@@ -167,7 +206,10 @@ def main(argv=None):
     write_json(out/'run-config.json',run_config)
     write_json(out/'configs'/f'{args.run_name}-{args.mode}.json',run_config)
     server = VisualServer(PROJECT_ROOT,out,args.host,args.port,
-        visual_config={key:value for key,value in cfg.to_dict().items() if key.startswith('visual_')}
+        visual_config={key:value for key,value in cfg.to_dict().items() if key.startswith('visual_')},
+        recording_config={key:value for key,value in vars(args).items() if key in (
+            'recording_fps','recording_width','recording_height','recording_duration_seconds',
+            'recording_bitrate','recording_max_bytes','recording_max_seconds')}
         ).start() if args.visualize or args.mode=='serve' else None
     if server:
         print(f'Visualization: {server.url}',flush=True)
@@ -183,6 +225,15 @@ def main(argv=None):
         write_json(existing_path,existing)
     tasks = ['coverage','tracking'] if args.task=='both' else [args.task]
     try:
+        if args.mode=='formal':
+            from src.formal_run import run_formal
+            report=run_formal(args,cfg,tasks,server,run_config)
+            if not report['task_goals_passed']:
+                raise RuntimeError('Latest policies failed a declared task goal; inspect formal-report.json')
+            if server and args.keep_server:
+                print(f'Formal run complete. Replay interface: {server.url}',flush=True)
+                while True: time.sleep(.5)
+            return report
         if args.mode=='expert-validate':
             from expert_validation import run_validation
             suite=run_validation(cfg,output_dir=out/'diagnostics'/'expert-randomized',
@@ -243,22 +294,16 @@ def main(argv=None):
             if args.mode in ['all','collect']:
                 seconds=args.collection_coverage_seconds if task=='coverage' else args.collection_tracking_seconds
                 short_cfg=replace(cfg,**{f'{task}_episode_seconds':seconds})
-                accepted=[];rejected=[]
-                write_json(manifest_path,{'task':task,'complete':False,'paths':[]})
-                for attempt in range(args.episodes*args.collection_attempt_multiplier):
-                    seed=args.collection_seed+task_index*10000+attempt
-                    record,path=rollout(short_cfg,expert_class(short_cfg),'expert',seed,
-                                         dataset_dir,f'episode-{seed}',record_observations=True)
-                    target=accepted if record['metadata']['expert_valid'] else rejected
-                    target.append({'seed':seed,'json':str(path.resolve()),'summary':record['summary']})
-                    if len(accepted)>=args.episodes: break
-                item['collection']={'accepted':accepted,'rejected':rejected}
-                if len(accepted)<args.episodes:
-                    save_report()
-                    raise RuntimeError(f'{task}: only {len(accepted)}/{args.episodes} physically safe demonstrations; inspect rejected JSON')
-                write_json(manifest_path,{'task':task,'complete':True,
-                    'paths':[str(Path(record['json']).with_suffix('.npz')) for record in accepted],
-                    'config':asdict(short_cfg),'collection_seed':args.collection_seed})
+                if args.dataset_manifest is not None:
+                    raise ValueError('Collection writes its own accepted-manifest.json; external manifests are train/evaluate inputs')
+                from src.collection import collect_expert_episodes
+                collection=collect_expert_episodes(task,short_cfg,dataset_dir,
+                    episodes=args.episodes,seed=args.collection_seed+task_index*10000,
+                    workers=args.collection_workers,attempt_multiplier=args.collection_attempt_multiplier,
+                    replay_every=args.collection_replay_every,progress_every=args.progress_every,
+                    server=server,resume=args.collection_resume,
+                    require_task_success=args.collection_require_task_success)
+                item['collection']={key:collection[key] for key in ['accepted','rejected']}
             model_dir=out/'models'/task
             deployment=model_dir/'selected.pt'
             if (args.mode=='evaluate' and cfg.potential_enabled and args.closed_loop_selection
@@ -345,6 +390,8 @@ def main(argv=None):
                     model_config=model_config,
                     initial_checkpoint=initial_checkpoint,
                     split_reference_checkpoint=args.split_reference_checkpoint,
+                    progress_every=args.training_progress_every,progress_seconds=args.training_progress_seconds,
+                    load_workers=args.training_load_workers,resume_checkpoint=args.resume_checkpoint,
                     metadata={'simulation_config':asdict(cfg),'command':run_config})
                 item['training']=training
                 checkpoint=Path(training['best_checkpoint'])
@@ -371,7 +418,7 @@ def main(argv=None):
                     if not matches: raise FileNotFoundError(f'No trained {task} checkpoint in {out/"models"/task}')
                     checkpoint=matches[0]
                 import torch
-                torch.set_num_threads(args.num_threads)
+                torch.set_num_threads(args.inference_num_threads)
                 actor=NeuralPolicy.from_checkpoint(checkpoint,device=args.inference_device)
                 seed=args.expert_seed+task_index
                 expert_record=demo

@@ -1,118 +1,231 @@
 # Area-coverage-and-target-tracking
 
-单固定翼UAV、单艘科考船、300 km × 300 km二维海域；两个独立GRU模仿学习模型。云只限制飞机，岛只限制船舶；覆盖用右侧扇形，跟踪用可偏转前视扇形。
+单架固定翼无人机、单艘科考船、300 km × 300 km二维海域，使用**两套独立启发式专家、两套独立数据集、两套独立CNN+GRU策略网络**实现持续区域覆盖与移动目标跟踪。基于Gymnasium，原生JavaScript海图支持实时显示、JSON历史回放和真实MP4录屏，Matplotlib提供离线绘图/视频导出。
 
-详细算法、等式约束、初始化和接口见[设计文档](docs/superpowers/specs/2026-11-27-maritime-imitation-design.md)，实施步骤和问题修复见[实施方案](docs/superpowers/plans/2026-11-27-maritime-imitation-implementation.md)。
+## 功能与任务边界
 
-本分支 `feat/local-potential-field` 在 `c56e40c` 上增加局部引斥场。新接口、指数曲线、优化评分与实现步骤见[局部场设计](docs/superpowers/specs/2026-11-27-local-potential-field-design.md)及[实施计划](docs/superpowers/plans/2026-11-27-local-potential-field.md)。`run.sh` 默认启用 field-v2，独立输出到 `outputs/field-v2`、`tf-logs/field-v2`；旧 v1 数据和权重保持独立。
+- 覆盖：随机选取10–20 km尺度的目标子区域，在其边界随机初始化UAV并筛选物理可行性；右侧安装的3 km扇形雷达扫描海面，维护首扫、重扫和扫描年龄。
+- 跟踪：船舶沿全域螺线参考航路恒速前进，遇岛屿以A*规划绕行，有限舵角/舵速模型实际推进。UAV在距目标1.6–2.4 km的可行位置初始化，以可偏转前视扇形持续跟踪。策略始终获得船舶真实状态，视场内可见性另行计算。
+- 雷云只限制UAV；岛屿只限制船舶，UAV可以飞越岛屿。岛屿不计入海面覆盖面积。
+- 覆盖的正引力**只存在于目标子区域海面**；区外为−1，雷云及飞行安全膨胀区为−2。局部场以外的无效查询填0并提供有效掩码，不表示吸引力。
+- 全域飞越栅格随访问时间渐淡，雷达扫描年龄单独展示；默认60秒流星尾迹，可关闭或切换完整轨迹。实体模型按运动方向旋转，雷达距离保持真实比例，图标保留最小可见像素。
+- 正式流程自动执行专家预检、并行采集、分组划分、两网络训练、独立闭环测试及最新权重前端录屏；状态/错误/失败轨迹均落盘。
 
-新场值为：刚扫描 −1、按归一化指数在信息价值失效周期 T 恢复至 +1；从未扫描 +1；ROI 外 −1；雷云及安全膨胀区固定 −2。覆盖正引力只在当前子任务 ROI 的海水格中存在，数值和绘图均遵守边界。只生成 UAV 周围半径内的33×33场，历史仅存扫描时间戳；T 控制信息老化，不是重访期限。两个任务分别使用带运动几何参考的残差 CNN+GRU 模型，共同输入 `vector + potential + field_context`，输出世界 XY 单位速度方向与归一化雷达 pan；恒速、有限滚转与雷达转速仍由环境执行。侧视/前视保留各自安装方向。前端“局部引斥场”开关与 MP4 使用同一固定色标。
+有限时域仿真验收不构成任意场景或无限时间的安全证明。历史测试中覆盖纯网络出现过碰云，因此纯网络与显式物理约束系统分别测试和标记。训练误差下降不能替代闭环任务验收。
 
-field-v2 专家当前24/24固定场景通过，0排除、0失败：16例覆盖各10800秒全部达到100%，8例跟踪各1800秒全程可见。跟踪网络在6个验证回合和4个新的独立1800秒测试回合均全程可见；覆盖网络尚在闭环修复中。新版本的验收范围、失败证据与本地路径见[局部场验证记录](docs/local-potential-field-validation.md)。旧 v1 的64例专家、17例跟踪网络及覆盖网络局限见[原验证状态](docs/validation-status.md)，这些旧数字不计入 field-v2。
+## 安装与入口
 
-覆盖候选第31轮虽通过固定验证和4个新测试，实际7100演示仍在37秒碰云，已撤下部署别名并保留失败回放。后续使用该场景进行训练诊断，新独立测试集另行冻结；不会以低损失或此前成功案例替代这次失败。
-
-共享云编码修复和后续执行感知损失候选都在新测试中出现碰云，覆盖纯网络仍未发布。场逻辑独立审计覆盖74份回放、34,303个快照，6,873,041个正值全部局限在ROI海面；独立按0.1秒原动作重放也复核了扫描写入与指数老化。这项通过不代表网络飞行安全。详细权重SHA、指标及控制分歧见上面的验证记录。
-
-`--policy-safety-layer forecast` 为默认关闭、仅供field-v2显式评估的物理预测约束原型；安全时透传网络动作，冲突时公开记录几何修正。回放分别保存原始、约束后和实际动作，并标记“显式物理约束”。它不调用任务专家，使用同一观测及既有动力学；有限时域预测不构成全局安全证明，也不能代替纯网络验收。
-
-该显式约束版本在冻结权重/代码后通过27个已知3h回归及4个新3h场景32300–32303，全部安全且100%首扫。已知场景5例共12次干预；新场景32302另有12次干预，其余3例为0。原始覆盖网络仍拒绝发布；可选系统与纯模型分别记录在本地 `deployment-artifacts.json` 的 `guarded_systems` 与 `models`。完整286项测试通过，实际main/SSE/历史/四部MP4均独立审计，详细证据见验证记录。
-
-本地可选覆盖系统权重与完整配置在 `outputs/field-v2/systems/coverage-forecast/`；已有演示在 `outputs/field-v2/final-demo-forecast-constraint/`，回放界面为 `http://127.0.0.1:8791/`。显式启用示例（8792避免占用已有演示）：
-
-```bash
-bash run.sh evaluate --task coverage --policy-safety-layer forecast \
-  --checkpoint-path outputs/field-v2/systems/coverage-forecast/coverage_policy.pt \
-  --output-dir outputs/field-v2/guarded-runs --tf-log-dir tf-logs/field-v2 --port 8792
-```
-
-上述本地权重、数据、影片和TF日志按.gitignore排除；源代码及配置入口在Git分支中，克隆代码不会自动获得这些本地产物。
-
-## 安装与运行
-
-新训练默认采用任务分别配置的云编码（`--field-cloud-geometry-encoder auto`）：覆盖使用共享几何编码，跟踪保留slots。已保存模型、warm-start和DAgger始终继承checkpoint实际架构。跨架构fresh重训可用 `--split-reference-checkpoint` 固定历史场景划分，权重和归一化重新初始化。
-
-Python 3.10+：
+Python3.10+，Windows使用Git Bash；GPU训练需安装与本机驱动匹配的PyTorch CUDA版本。
 
 ```bash
 python -m pip install -r requirements.txt
-bash run.sh all
+npm install --no-save playwright
+npx playwright install chromium
+bash run.sh formal
 ```
 
-Windows请在Git Bash运行。PowerShell可显式调用：
-
-```powershell
-& 'C:/Program Files/Git/bin/bash.exe' ./run.sh all
-```
-
-`run.sh`集中列出仿真、专家、训练、路径和录像参数；修改其中数值，或在命令末尾覆盖对应CLI参数。`--device auto`优先可用CUDA。首次完整流程包括长专家试跑、两套采集、两次训练和闭环录像，耗时取决于硬件。
+自动录像优先复用已安装Chrome/Edge，也支持Playwright Chromium。没有浏览器时，可加`--no-browser-recording`运行仿真训练；自动前端录屏需要补齐浏览器。所有Python仿真、专家、训练、路径、端口及录像超参数集中于`run.sh`，经CLI传给`main.py`；末尾参数可以覆盖入口默认值。
 
 ```bash
-bash run.sh expert                         # 先验证两位专家，开启端口界面并导出影片
-bash run.sh expert-validate --no-visualize --no-open-browser --no-keep-server
-# 固定64案例：30随机覆盖、3个ROI各8个边界起点、10随机跟踪；耗时较长，可续跑
-bash run.sh collect                        # 各自采集；失败轨迹不进入成功清单
-bash run.sh train                          # 根据成功清单分别训练
-bash run.sh evaluate                       # 从已保存专家场景恢复，再运行两网络
-bash run.sh serve                          # 只启动历史回放界面
-bash run.sh expert --no-potential-field --output-dir outputs/legacy-check  # 显式使用保留的 v1 专家
-bash run.sh train --task tracking          # 单任务单独训练
-bash run.sh dagger --task coverage --dagger-beta 0.8 --run-name coverage-dagger-1
-# 继续训练时可用 --warm-start --checkpoint-path ...；只补采用 --dagger-collect-only
+# 默认正式配置：每任务1000个成功回合，800训练/200验证，另做独立闭环测试
+bash run.sh
+# 后台/自动运行：关闭自动打开浏览器和完成后常驻服务
+bash run.sh formal --no-open-browser --no-keep-server
+# 单任务；同一协议中断后直接重复命令可续采集、从最近完整epoch恢复
+bash run.sh formal --task tracking --no-open-browser
+# 保留的分阶段接口
+bash run.sh collect --task coverage
+bash run.sh train --task tracking
+bash run.sh expert-validate --no-open-browser --no-keep-server
+bash run.sh serve
+python main.py --help
+python -m tensorboard.main --logdir tf-logs --host 127.0.0.1 --port 6006
 ```
 
-默认界面为[http://127.0.0.1:8787](http://127.0.0.1:8787)，任务完成后保持服务直到Ctrl+C。自动运行可加`--no-open-browser --no-keep-server`；不需要端口界面时加`--no-visualize`。独立回放也可直接：
+默认界面http://127.0.0.1:8787，TensorBoard http://127.0.0.1:6006。默认输出`outputs/formal`，指标`tf-logs/formal/{coverage,tracking}/formal-1000`。正式默认：覆盖10800秒、跟踪1800秒；采集8进程、展示帧间隔60步；20epochs、batch16、TBPTT长度128、学习率0.0003、验证比例0.2、GRU128、训练线程4、批内加载线程4。预检种子7100/7101；独立测试覆盖960000–960007、跟踪970000–970007。
 
-```bash
-python main.py --mode serve --potential-field --output-dir outputs/field-v2 --tf-log-dir tf-logs/field-v2 --port 8787
-tensorboard --logdir tf-logs --port 6006
+`--episodes`是**每任务成功回合数**。每回合完整观测、专家标签和实际动作均保留；稀疏展示帧不降低物理积分或训练采样频率。无法初始化、规划失败、物理失败和任务未完成分别保留，只有成功清单中的NPZ进入训练。正式流程不使用旧数据或warm start；同源代码/配置/预算/种子协议可续跑，协议不一致必须使用新输出目录。
+
+200个每轮用于计算损失的回合称为验证集，独立测试场景不参与归一化、训练或权重选择。最终影片**仅加载本轮最后一轮`last.pt`**，按SHA256冻结，不回退`best.pt`或专家动作。覆盖影片默认公开启用`forecast`物理约束，跟踪使用纯网络；覆盖纯网络结果同时保留。可通过`--formal-coverage-safety-layer none`明确改为纯网络验收。
+
+## 数学模型
+
+所有计算使用米、秒、弧度，x向东、y向北，航向从+x逆时针。飞机和船均恒速，动作只改变方向，不能原地停止或跳点。
+
+### 固定翼和船舶
+
+固定翼状态为$(x,y,\psi,\phi)$，协同转弯与有限滚转响应为：
+
+$$
+\dot x=V_a\cos\psi,\quad \dot y=V_a\sin\psi,\quad
+\dot\psi=\frac{g}{V_a}\tan\phi,\quad
+\dot\phi=\operatorname{clip}\left(\frac{\phi_c-\phi}{\tau_\phi},-\dot\phi_{max},\dot\phi_{max}\right).
+$$
+
+$$
+|\phi|\le\min\left(\phi_{max},\arctan\frac{V_a^2}{gR_{min}}\right),\quad
+|\dot\psi|\le V_a/R_{min},\quad V_a=220/3.6\;\mathrm{m/s},\quad R_{min}=1000\;\mathrm m.
+$$
+
+船舶状态$(x_s,y_s,\psi_s,r,\delta)$采用一阶Nomoto模型：
+
+$$
+\dot x_s=V_s\cos\psi_s,\quad \dot y_s=V_s\sin\psi_s,\quad
+\dot\psi_s=r,\quad T_r\dot r+r=K\delta,\quad
+\dot\delta=\operatorname{clip}((\delta_c-\delta)/\tau_\delta,-\dot\delta_{max},\dot\delta_{max}).
+$$
+
+$V_s=12$节；舵角、舵速和转弯半径均有限制。A*输出航路，路径跟随器输出期望航向，再由上述模型积分。决策步长1秒、物理检查0.1秒，内部RK4最大步长0.05秒。速度参考彩虹系列和科考船公开资料；转弯/舵机系数为明确列出的仿真参数，未声称完成真实机船辨识。详见[运动学说明](docs/kinematics.md)。
+
+雷达实际偏角也受转速约束：$\dot\alpha=\operatorname{clip}((\alpha_c-\alpha)/\Delta t,-\omega_{radar},\omega_{radar})$。点$q$命中的条件为$\|q-p_a\|\le3000$且$|\operatorname{wrap}(\operatorname{atan2}(q_y-y_a,q_x-x_a)-\psi-\beta-\alpha)|\le\pi/6$。覆盖安装角$\beta=-\pi/2$、偏角限幅±60°；跟踪$\beta=0$、限幅±120°，最大偏转速度30°/s。按实际扇形与物理子步判定命中。
+
+### 局部引力–斥力场
+
+覆盖格距上次扫描的时间为$a$，信息失效周期$T=3600$s，衰减形状$k=3$。令$z=\operatorname{clip}(a/T,0,1)$：
+
+$$
+F(a)=1-2\frac{e^{-kz}-e^{-k}}{1-e^{-k}}.
+$$
+
+刚扫描$F=-1$，经过$T$恢复$+1$，未扫描也为$+1$；$T$是信息价值失效周期，**不是重访保证**。覆盖子区域海面以外固定−1；雷云、安全膨胀区和全域外为硬斥力−2，优先级最高。只计算UAV周围6 km半径内的33×33局部场，全域历史仅保留扫描时间戳。覆盖质量另用ROI64×64海面格统计，二者用途和分辨率不同。
+
+跟踪场按船舶距离构造局部吸引值，并叠加相同硬障碍；不沿用覆盖任务的时间老化或把全域海面当成覆盖目标。EGO-Planner启发了按需构造局部信息的思路，**上述有符号指数曲线和固定翼启发式为本项目工程设计，并非复现EGO-Planner算法**。
+
+### 专家目标与约束
+
+覆盖专家从有限航向候选和雷达偏角候选中最大化：
+
+$$
+J_c=w_g\,d\cdot d_{goal}+w_s U_{sector}+w_p F_{path}
+-w_b C_{outside}-w_o C_{hard}-w_t|\operatorname{wrap}(\psi_c-\psi)|.
+$$
+
+$U_{sector}$汇总实际可达扇形内的场值，并含目标对准收益、雷达转动惩罚；候选预测遵守最大转率，选中动作再进行有限滚转的精确避障预测。全局公开扫描目标依据未扫优先、年龄、距离和近期目标去重产生，避免纯局部势场长期循环；专家和网络都能从相同obs获得该目标。目标区外−1为软偏好，不能将其错误当成绝不越出的硬墙：固定翼转弯可以短暂使用区外缓冲。
+
+跟踪专家在移动目标参考系中维持期望绕飞半径$r_d=2000$m。设$e=(p_a-p_s)/\|p_a-p_s\|$，$t$为顺时针切向，
+
+$$
+ n=\frac{t-k_r(\|p_a-p_s\|-r_d)e/r_d}{\|t-k_r(\|p_a-p_s\|-r_d)e/r_d\|},\quad
+ \lambda=-v_s\cdot n+\sqrt{(v_s\cdot n)^2+V_a^2-\|v_s\|^2},\quad
+ d=\frac{v_s+\lambda n}{V_a}.
+$$
+
+雷达偏角对准船舶并补偿相对视线角速度。运动学等式、转弯/舵机/雷达速率、雷云和边界为约束；距离/视场为跟踪目标和失败判据。实现对滚转延迟作预测补偿，近障碍使用受限斥力和几何避让。有限候选启发式不是求得全局最优的非线性规划器。
+
+显式`forecast`层独立预测网络动作未来30秒的物理轨迹：安全时原样透传，冲突时公开记录几何修正，再检查修正轨迹。它不调用覆盖/跟踪任务专家；原始网络动作、约束后动作、实际动作及干预标志分别保存。它有有限预测视野，不构成全局安全证明。
+
+## 观测、网络与损失
+
+专家`act(obs)`与网络`act(obs)`接收同一字典，返回同一float32动作。仿真直接提供真实位置/速度、最近障碍几何、雷达状态和公共目标，无需感知模型。
+
+| 字段 | 覆盖 | 跟踪 | 内容 |
+|---|---:|---:|---|
+| `vector` |111|134|自身运动、雷达/边界/云/岛槽位及有效位、目标相对位置/速度等 |
+| `potential` |4×33×33|4×33×33|有符号场、任务海面、硬障碍、有效查询掩码 |
+| `field_context` |16|16|场半径/周期/形状、安装角/偏角限制/转速、目标等 |
+| `action` |3|3|世界XY单位期望方向 + 归一化雷达偏角 |
+
+期望速度方向设定为$V_a\,a_{0:2}$，实际速度为$V_a(\cos\psi,\sin\psi)$，雷达指令为限幅角乘$a_2$；环境仍统一执行运动学限制。默认在网络内部旋转至机体系，屏蔽上一拍命令以减少复制捷径，公共接口保持世界坐标。
+
+每个网络独立拥有：局部场CNN(4→16→32→32→128)、运动矢量MLP、场上下文MLP(16→64→64)、单层GRU128、方向和雷达残差头。覆盖默认对云集合共享编码并池化，跟踪保留固定槽位编码；方向/雷达几何参考只使用公开观测。GRU保留历史，但不能凭空恢复从未观测的信息。
+
+序列BC采用真实回合、因果TBPTT：每回合reset，chunk间传递并detach隐藏状态，padding不计损失，$T+1$观测对应$T$动作，禁止错一拍。默认优化：
+
+$$
+\mathcal L_{BC}=\frac{1}{N}\sum_{t=1}^N\|\pi_\theta(o_{\le t})-a_t^E\|_2^2,\quad
+\operatorname{MSE}=\mathcal L_{BC}/3,\quad
+\operatorname{MAE}=\frac{1}{3N}\sum_t\|\pi_\theta(o_{\le t})-a_t^E\|_1.
+$$
+
+可选纠正加权/执行感知损失默认关闭；启用后Loss含额外项，原始MSE/MAE仍按共同动作计算。归一化仅拟合训练集，同一`scene_group_id`不能跨训练/验证。只上报适用的6条TF曲线：`Train/Loss`、`Validation/Loss`、两子集的`Action_MSE`和`Action_MAE`。当前确定性连续策略不伪造离散准确率、NLL、KL或熵。
+
+`best.pt`按验证MSE保存，`last.pt`保存最新完成epoch。完整epoch边界续训恢复Adam、RNG、划分、归一化和历史，批内加载有界；普通warm-start只恢复模型且重新初始化优化器，不等同续训。普通CUDA可能有浮点非确定性，严格可复现需一致环境及确定性设置。每chunk更新`training-status.json`，每epoch原子更新checkpoint和`history.json`。
+
+## Python与HTTP接口
+
+```python
+# 项目内部采用src目录导入；独立调用时加入该路径
+import sys
+sys.path.insert(0, 'src')
+from config import Config
+from env_coverage import CoverageEnv
+from expert_field import FieldCoverageExpert
+cfg = Config(potential_enabled=True)
+env = CoverageEnv(cfg, render_mode='json')
+obs, info = env.reset(seed=2000)
+expert = FieldCoverageExpert(cfg)
+expert.reset()
+action = expert.act(obs)
+obs, reward, terminated, truncated, info = env.step(action)
+frame = env.render()  # 真实状态字典；通过VisualServer.publish发送
+scene = env.scene    # 可通过reset(options={'scene': scene})精确回放初始化
+loaded = env.summary()
+env.close()
 ```
 
-入口参数帮助：`python main.py --help`。仿真/专家全部参数位于`run.sh`的`SIM_CONFIG`，通过`--config-json`整体传入Python；不是隐藏在另一份配置文件中。
+`TrackingEnv`/`FieldTrackingExpert`使用相同接口；`NeuralPolicy.from_checkpoint(path, device='cpu')`得到网络actor。`collect_expert_episodes(task, config, output_dir, episodes=..., seed=..., workers=..., attempt_multiplier=..., replay_every=..., progress_every=..., require_task_success=True)`返回权威manifest。`train_policy(task, manifest, model_dir, tf_log_dir, ...)`训练单任务；`record_policy_replay(server_url, replay_path, output_dir, fps=24, width=1440, height=900, duration_seconds=30)`自动调用与UI相同录屏功能。
 
-覆盖模型可用 `--coverage-mask-previous-command` 做独立消融：仅在模型内部预处理将上一拍命令 `vector[8:10]` 置零，原始共同观测和世界XY单位方向动作接口保持不变，tracking不受影响。`run.sh`显式默认 `--no-coverage-mask-previous-command`；旧checkpoint缺少 `model_config.mask_previous_command` 时按False解释，保留原行为。此开关只决定fresh覆盖训练的架构；warm-start与DAgger明确继承checkpoint配置，不用该fresh开关重解释旧权重。要启用该消融，应从零训练，或继续训练已保存True标志的模型。该选项本身不代表覆盖闭环已经达标。
-
-## 产物
-
-| 路径 | 内容 |
+| 路由 | 用途 |
 |---|---|
-| src/ | 物理、环境、专家、两网络、采集、训练与服务源码 |
-| visual/ | 原生JS海图、实时SSE、历史回放 |
-| figs/ | 下载的彩虹CH-4、科考船、海洋照片；加载式二维SVG模型及来源许可 |
-| outputs/field-v2/datasets/{coverage,tracking}/ | 默认采集的完整JSON、派生NPZ、accepted-manifest |
-| outputs/field-v2/models/{coverage,tracking}/ | best.pt、last.pt、通过闭环选择后的 selected.pt |
-| outputs/field-v2/{coverage,tracking}-experiment/ | 本地实跑数据、分组划分、候选权重、失败及测试回放 |
-| outputs/field-v2/replays/、outputs/field-v2/final-demo-current/ | 专家/网络JSON、H.264 MP4与PNG |
-| outputs/field-v2/training/、outputs/field-v2/reports/ | 训练报告和阶段报告 |
-| outputs/field-v2/validation-report.json | 默认入口的两任务合并结果 |
-| outputs/diagnostics/、outputs/cache/ | 诊断记录与缓存 |
-| tf-logs/ | 分任务/分实验的TensorBoard事件文件 |
+| `/events` |SSE场景、真实帧、进度和正式运行状态 |
+| `/api/replays` |JSON历史目录（大文件后台索引） |
+| `/api/visual-config` |入口显示配置 |
+| `/api/recording-config` |尺寸、FPS、码率、时长、上传限额 |
+| `/api/run-status` |当前采集数量、训练阶段/epoch/损失 |
+| `POST /api/recordings` |有界原始视频上传，真实转码为H.264 MP4并保存来源元数据 |
+| `/outputs/...` |当前输出根目录内的回放/影片下载 |
 
-JSON训练数组使用可无损解码的zlib+base64，不依赖NPZ才能恢复。可用`src.rollouts.restore_training_cache(json_path)`重建训练缓存。演示JSON的frames是完整真实状态轨迹，前端可导入文件；选择策略、拖动进度条、切换任务区/全域/跟随视角。
+在界面选择历史后点击“开始录制”，可保存完整回放；点击“停止并保存”可提前停止，影片真实记录停止时刻。浏览器支持时直接录MP4，否则先捕获WebM再由FFmpeg转码，不改扩展名冒充MP4。自动录像含任务、模型SHA、控制模式、仿真时间和真实任务结果；转换失败会在UI显示错误。默认30秒、1440×900、24FPS，回放倍速只影响显示时间，不改变仿真速度。
 
-全世界按250m栅格记录飞机实际飞越位置，最近飞越的格子最深，随仿真时间渐淡；雷达扫描年龄图独立显示。默认显示60秒流星尾迹，可关闭或切为完整轨迹。历史拖动会重建截至当前时刻的记录，不显示未来足迹。远景网格线自动抽稀，底层访问格大小不变。
+## 项目结构与产物
 
-雷达始终按真实3km绘制。图标按参考长宽缩放，同时保留最小像素以便辨认；因此全域视角的图标是有最小可见尺寸的符号，并非严格等比例的实机轮廓。`SIM_CONFIG`中的16个`visual_*`参数可控制网格、渐淡、尾迹、参考尺寸、最小像素及默认开关。服务通过`/api/visual-config`把当前入口的显示参数提供给旧回放，不改变其物理数据。
+```text
+main.py                     CLI、阶段编排、服务启动
+run.sh                      全部显式超参数
+requirements.txt
+src/
+  config.py dynamics.py     配置与机船运动学
+  scenario.py navigation.py 随机筛选、SceneSpec、船舶A*航路
+  env_base.py               Gym公共基类/物理推进/render
+  env_coverage.py env_tracking.py
+  observations.py potential_field.py
+  expert_field.py           场感知覆盖/跟踪专家
+  expert_coverage.py expert_tracking.py
+  policy_field.py policy_coverage.py policy_tracking.py
+  policy_constraints.py     显式可选物理预测约束
+  rollouts.py collection.py JSON/NPZ轨迹、并行续采集
+  datasets.py train.py      分组、序列、BC、TF、续训
+  formal_run.py             正式协议/状态/最新权重测试与录像
+  visual_server.py browser_recording.py rendering.py
+visual/                     JS海图、实时/历史、录屏
+figs/                       本地彩虹UAV/科考船/海洋素材及许可
+examples/ tests/ docs/       示例、回归测试、设计与验证记录
+outputs/formal/
+  formal-protocol.json      运行前冻结的训练/测试协议
+  formal-status.json        实时阶段/数量/损失/错误
+  formal-report.json        本轮实际专家/训练/测试/影片证据
+  datasets/{coverage,tracking}/
+    accepted-manifest.json  成功清单、拒绝/失败/未使用记录、源SHA
+    episode-*.json/.npz     完整无损训练数据与稀疏展示帧
+  models/{coverage,tracking}/
+    best.pt last.pt history.json training-status.json
+  frozen-latest/            最后权重不可变SHA快照
+  closed-loop-tests/        独立场景，纯网络/约束模式分别保存
+  preflight/ replays/       专家预检及最新网络实际回放
+  recordings/              MP4及来源/解码证据JSON
+  cache/                    有界临时缓存
+tf-logs/formal/{coverage,tracking}/formal-1000/
+```
 
-两模型不共享参数。field-v2 动作为二维期望世界速度方向加雷达 pan 指令，v1 保留原二维动作；真实机船位置由有限倾斜/舵机响应模型推进，不能直接跳点。图片/二维模型只影响显示，按真实速度旋转。
+JSON中的训练数组以zlib+base64无损编码，可用`src.rollouts.restore_training_cache`恢复NPZ。展示帧通过`frame_action_indices`对应原始动作，不能把稀疏帧误当训练抽样。Git只上传源码、文档、测试、必要素材；数据、模型、影片、TF和缓存全部忽略。克隆仓库后需重新生成，不能依赖本机旧路径。
 
-## 训练指标与检查
-
-仅记录确定性连续策略适用的6条曲线：Train/Validation的Loss、Action_MSE、Action_MAE。field-v2 默认Loss是每步三个动作分量的平方误差和，MSE为逐分量均值；可选纠正权重启用时Train/Loss记录实际加权目标，MSE/MAE与Validation始终不加权；不虚构离散准确率或概率分布指标。验证集按完整场景划分，同一场景的相邻时间片不会泄漏。`best.pt` 按验证原始Action_MSE保存，部署 `selected.pt` 只按验证场景闭环结果生成；测试场景不参与选择。
-
-可选 `--field-steering-loss-weight` 默认0；大于0时Loss额外包含根据相同观测计算的执行感知excess BCE，以监督实际左右转分支。原动作MSE/MAE、输入输出和推理控制保持原义。该项尚须独立闭环验证，不能据此声称安全；公式和局限见局部场设计。
-
-`run.sh`还显式设置`--dagger-recovery-min-steps 7200`：短DAgger失败前缀按完整回合重复采样，每次重置GRU，不能拼接成虚构连续轨迹。原始场景划分、归一化和验证不重复；checkpoint记录采样预算及各回合实际曝光。设为0可关闭。无验证集时，重复采样模型按唯一训练回合的独立推理误差选取，避免与第0轮比较不同分布。
+## 验证与参考
 
 ```bash
 python -m pytest -q
 python -m examples.plot_kinematics --output outputs/kinematics/kinematics.png
 ```
 
-低验证误差不能替代闭环测试。应同时查看覆盖率/重扫/扫描年龄、跟踪真实可见性/距离和碰撞越界结果。随机场景的物理可行性和有限时域专家可行性不构成全局保证。
+正式本轮结果以运行后生成的`outputs/formal/formal-report.json`为准，未完成前不将历史结果当成本轮验收。开发阶段启发式专家示教已实测完整10800秒覆盖2/2、1800秒跟踪2/2通过；八进程采集小批量最快；1000+1000回合存储估计约67 GB，不含失败与测试。详细性能、测试和已知边界见[正式实施记录](docs/formal-training-validation.md)。之前的纯覆盖网络失败与显式约束验证保留在[历史验证](docs/local-potential-field-validation.md)，对应本地旧缓存按本次要求清理。
 
-全域螺线约2000 km，科考船按12节走完需80–90小时；演示保留真实速度，倍速只是回放。当前未模拟燃油，没有承诺所有海格固定时限重访，也未穷举整条多小时船路的动力学状态。照片和二维示意模型的具体来源见[素材说明](figs/ATTRIBUTION.md)。
-
-Git仅跟踪源码、文档、测试和必要授权素材；数据、权重、影片、TensorBoard日志及缓存全部忽略。克隆后需重新采集/训练，仓库不包含已验证的本地模型权重。JSON旁的`.replay-index.json`是可丢弃目录索引，大型旧回放在后台建立索引，避免首次历史列表阻塞界面。
-
-覆盖训练诊断及实际局限见 `outputs/diagnostics/coverage-learning-diagnosis.md`；DAgger训练混合数据在回放中有明确标注，不能当作纯网络部署效果。
+数学/初始化/文献详见[算法设计](docs/superpowers/specs/2026-11-27-maritime-imitation-design.md)、[局部场设计](docs/superpowers/specs/2026-11-27-local-potential-field-design.md)、[正式方案](docs/superpowers/specs/2026-11-28-formal-training-and-recording-design.md)。参考[Dubins](https://msl.cs.illinois.edu/~lavalle/planning/node821.html)、[EGO-Planner](https://arxiv.org/abs/2008.08835)、[持续覆盖规划](https://arxiv.org/abs/1908.09236)、[Fossen船舶模型](https://www.fossen.biz/html/marineCraftModel.html)；具体方法与论文贡献的区别在设计文档明确说明。图片及二维模型许可见[素材说明](figs/ATTRIBUTION.md)。
