@@ -24,8 +24,8 @@ def parser():
                    help='Field-v2 model: mask previous command to reduce action-copy shortcuts')
     p.add_argument('--field-frame', choices=['body','world'], default='body',
                    help='Field-v2 internal frame; public observations/actions always use world axes')
-    p.add_argument('--field-cloud-geometry-encoder',choices=['slots','shared_pool_v1'],default='slots',
-                   help='Fresh field model: original cloud slots or a shared permutation-invariant cloud encoder')
+    p.add_argument('--field-cloud-geometry-encoder',choices=['auto','slots','shared_pool_v1'],default='auto',
+                   help='Fresh field model: auto uses shared_pool_v1 for coverage and slots for tracking; saved models keep their own architecture')
     p.add_argument('--field-pan-residual', action=argparse.BooleanOptionalAction, default=True,
                    help='Field-v2 radar head predicts correction from observed actual pan')
     p.add_argument('--tracking-pan-reference', choices=['actual','goal'],default='goal',
@@ -266,7 +266,9 @@ def main(argv=None):
                 if cfg.potential_enabled:
                     model_config={'potential_field':True,'mask_previous_command':args.field_mask_previous_command,
                                   'field_frame':args.field_frame,'pan_residual':args.field_pan_residual,
-                                  'cloud_geometry_encoder':args.field_cloud_geometry_encoder,
+                                  'cloud_geometry_encoder':(
+                                      'shared_pool_v1' if task=='coverage' else 'slots')
+                                      if args.field_cloud_geometry_encoder=='auto' else args.field_cloud_geometry_encoder,
                                   'pan_reference':args.tracking_pan_reference if task=='tracking' else args.coverage_pan_reference}
                     if task=='coverage':
                         model_config.update(direction_reference=args.coverage_direction_reference,

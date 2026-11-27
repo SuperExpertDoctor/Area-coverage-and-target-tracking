@@ -14,6 +14,8 @@ field-v2 专家当前24/24固定场景通过，0排除、0失败：16例覆盖�
 
 ## 安装与运行
 
+新训练默认采用任务分别配置的云编码（`--field-cloud-geometry-encoder auto`）：覆盖使用共享几何编码，跟踪保留slots。已保存模型、warm-start和DAgger始终继承checkpoint实际架构。跨架构fresh重训可用 `--split-reference-checkpoint` 固定历史场景划分，权重和归一化重新初始化。
+
 Python 3.10+：
 
 ```bash

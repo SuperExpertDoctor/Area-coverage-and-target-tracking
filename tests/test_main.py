@@ -102,3 +102,21 @@ def test_field_evaluation_requires_selected_model_instead_of_falling_back_to_bes
     monkeypatch.setattr(policy.NeuralPolicy, 'from_checkpoint', unexpected_load)
     with pytest.raises(FileNotFoundError, match='selected.pt'):
         main.main(['--mode', 'evaluate', '--potential-field'] + cli_args(tmp_path, monkeypatch))
+
+
+@pytest.mark.parametrize('task,expected', [('coverage', 'shared_pool_v1'), ('tracking', 'slots')])
+def test_main_selects_task_specific_default_cloud_encoder(tmp_path, monkeypatch, task, expected):
+    main = importlib.import_module('main')
+    train = importlib.import_module('src.train')
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(kwargs)
+        return dict(best_checkpoint=str(tmp_path / 'new.pt'), initial_validation_mse=1.,
+                    best_validation_mse=.5, best_epoch=1)
+
+    monkeypatch.setattr(train, 'train_policy', capture)
+    main.main(['--mode', 'train', '--potential-field', '--no-closed-loop-selection']
+              + cli_args(tmp_path, monkeypatch) + ['--task', task])
+    assert len(calls) == 1
+    assert calls[0]['model_config']['cloud_geometry_encoder'] == expected
