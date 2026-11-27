@@ -1,5 +1,6 @@
 outputs/
 tf-logs/
+.run-archive/
 __pycache__/
 .pytest_cache/
 *.pyc
