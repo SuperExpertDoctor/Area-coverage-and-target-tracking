@@ -1,20 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # All tunable simulation, expert, training and export values live in this entry.
-# Usage: bash run.sh [all|expert|expert-validate|collect|train|dagger|evaluate|serve] [extra main.py flags]
+# Usage: bash run.sh [formal|all|expert|expert-validate|collect|train|dagger|evaluate|serve] [extra main.py flags]
+# SIM_CONFIG.potential_enabled selects the protocol; --potential-field / --no-potential-field explicitly override it.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 PYTHON="${PYTHON:-python}"
-MODE="${1:-all}"
+MODE="${1:-formal}"
 if (($#)); then shift; fi
-OUTPUT_DIR="outputs"
-TF_LOG_DIR="tf-logs"
-RUN_NAME="$(date +%Y%m%d-%H%M%S)"
+OUTPUT_DIR="outputs/formal"
+TF_LOG_DIR="tf-logs/formal"
+RUN_NAME="formal-1000"
 # Optional explicit inputs. Empty strings use the task's standard output paths.
 CHECKPOINT_PATH=""
+SPLIT_REFERENCE_CHECKPOINT=""
+RESUME_CHECKPOINT=""
 DATASET_MANIFEST=""
 export PYTHONPYCACHEPREFIX="outputs/cache/python"
 export MPLCONFIGDIR="outputs/cache/matplotlib"
+export PYTHONIOENCODING=utf-8
+export PYTHONUNBUFFERED=1
+# Set before NumPy loads in the parent or spawned workers; training sets its
+# separate explicit PyTorch --num-threads budget below.
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 SIM_CONFIG=$(cat <<'JSON'
 {
   "world_bounds": [
@@ -27,6 +38,28 @@ SIM_CONFIG=$(cat <<'JSON'
   "roi_max_size": 20000.0,
   "roi_outer_buffer": 6000.0,
   "coverage_grid": 64,
+  "potential_enabled": true,
+  "potential_radius": 6000.0,
+  "potential_period": 3600.0,
+  "potential_decay": 3.0,
+  "coverage_pan_limit": 1.0471975511965976,
+  "potential_goal_hold_seconds": 180.0,
+  "potential_goal_radius": 1500.0,
+  "potential_unseen_bonus": 2.0,
+  "field_heading_offsets": [0.0, -0.18, 0.18, -0.36, 0.36],
+  "field_prediction_seconds": 8.0,
+  "field_path_samples": 4,
+  "field_guidance_weight": 2.0,
+  "field_scan_weight": 1.4,
+  "field_preference_weight": 0.2,
+  "field_roi_weight": 0.3,
+  "field_turn_weight": 0.05,
+  "field_obstacle_weight": 1.0,
+  "field_obstacle_influence": 2500.0,
+  "field_tracking_repulsion_limit": 0.12,
+  "field_pan_samples": 9,
+  "field_pan_goal_weight": 0.6,
+  "field_pan_slew_weight": 0.05,
   "cloud_min_count": 2,
   "cloud_max_count": 6,
   "max_clouds": 8,
@@ -162,31 +195,41 @@ SIM_CONFIG=$(cat <<'JSON'
   "visual_show_grid": true,
   "visual_show_trail": true,
   "visual_show_radar_age": true,
+  "visual_show_potential": true,
   "visual_trail_style": "meteor"
 }
 JSON
 )
 INPUT_ARGS=()
 if [[ -n "$CHECKPOINT_PATH" ]]; then INPUT_ARGS+=(--checkpoint-path "$CHECKPOINT_PATH"); fi
+if [[ -n "$SPLIT_REFERENCE_CHECKPOINT" ]]; then INPUT_ARGS+=(--split-reference-checkpoint "$SPLIT_REFERENCE_CHECKPOINT"); fi
+if [[ -n "$RESUME_CHECKPOINT" ]]; then INPUT_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT"); fi
 if [[ -n "$DATASET_MANIFEST" ]]; then INPUT_ARGS+=(--dataset-manifest "$DATASET_MANIFEST"); fi
 exec "$PYTHON" main.py \
   --mode "$MODE" --task both \
-  --config-json "$SIM_CONFIG" \
+  --config-json "$SIM_CONFIG" --field-mask-previous-command --field-frame body --field-cloud-geometry-encoder auto --field-pan-residual --tracking-pan-reference goal --coverage-pan-reference goal --coverage-direction-reference goal_orbit --tracking-direction-reference goal_orbit \
+  --closed-loop-selection --selection-coverage-seconds 10800 --selection-tracking-seconds 1800 --selection-render-every 60 --selection-workers 2 --selection-tracking-pan-stress 0.3490658503988659 \
   --output-dir "$OUTPUT_DIR" --tf-log-dir "$TF_LOG_DIR" --run-name "$RUN_NAME" \
   --visualize --open-browser --keep-server --host 127.0.0.1 --port 8787 \
   --render-every 5 --realtime-factor 0 --progress-every 300 \
-  --expert-seed 7100 --collection-seed 1000 \
-  --episodes 8 --collection-attempt-multiplier 3 \
-  --collection-coverage-seconds 5400 --collection-tracking-seconds 1800 \
-  --epochs 30 --batch-size 4 --sequence-length 64 \
+  --expert-seed 7100 --collection-seed 12000 \
+  --episodes 1000 --collection-attempt-multiplier 3 \
+  --collection-workers 8 --collection-replay-every 60 --collection-resume --collection-require-task-success \
+  --collection-coverage-seconds 10800 --collection-tracking-seconds 1800 \
+  --epochs 20 --batch-size 16 --sequence-length 128 \
   --learning-rate 0.0003 --weight-decay 0.00001 --grad-clip 1 \
-  --validation-fraction 0.25 --training-seed 42 \
+  --validation-fraction 0.2 --training-seed 42 \
+  --training-progress-every 50 --training-progress-seconds 30 --training-load-workers 4 \
   --hidden-size 128 --heading-residual --action-frame body --feature-frame auto --normalize-vectors --normalization-min-std 0.1 \
-  --correction-weight-max 1 --correction-threshold 0.1 \
-  --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
+  --correction-weight-max 1 --correction-threshold 0.1 --field-steering-loss-weight 0 --dagger-recovery-min-steps 0 \
+  --policy-safety-layer none --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
   --no-coverage-mask-previous-command \
-  --device auto --inference-device cpu --num-threads 1 \
-  --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-max-steps 0 --no-dagger-collect-only \
+  --device auto --inference-device cpu --num-threads 4 --inference-num-threads 1 \
+  --formal-test-episodes 8 --formal-test-seed 960000 --formal-test-workers 4 --formal-test-replay-every 60 \
+  --formal-coverage-safety-layer forecast --formal-monitor-seconds 30 --formal-resume \
+  --browser-recording --recording-headless --recording-fps 24 --recording-width 1440 --recording-height 900 \
+  --recording-duration-seconds 30 --recording-bitrate 8000000 --recording-max-bytes 268435456 --recording-max-seconds 600 \
+  --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-initial-pan-jitter 0 --dagger-max-steps 0 --no-dagger-collect-only \
   --validation-coverage-seeds 2000 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 3014 3015 3016 3017 3018 3019 3020 3021 3022 3023 3024 3025 3026 3027 3028 \
   --validation-boundary-seeds 4000 4001 4002 --validation-boundary-starts 8 \
   --validation-tracking-seeds 5000 5001 5002 5003 5004 5005 5006 5007 5008 5009 \

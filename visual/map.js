@@ -1,5 +1,5 @@
 /* All geometry uses Cartesian metres, +Y north and CCW heading in radians. */
-import {SparseVisitGrid, visualConfig, visitAlpha, adaptiveGridStep, modelSize, trailSegments} from './layers.js';
+import {SparseVisitGrid, visualConfig, visitAlpha, adaptiveGridStep, modelSize, trailSegments, potentialColor, potentialCellBounds} from './layers.js';
 export const finite = (v, fallback = 0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
 export const position = p => p && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y));
 export function velocityHeading(p) {
@@ -20,6 +20,7 @@ export class MaritimeMap {
     this.zoom = 1;
     this.pan = [0, 0];
     this.showAge = true;
+    this.showPotential = true;
     this.visualOverrides = {};
     this.layerPreferences = {};
     this.config = visualConfig({});
@@ -76,6 +77,7 @@ export class MaritimeMap {
     this.showGrid = this.layerPreferences.showGrid ?? this.config.visual_show_grid;
     this.showTrail = this.layerPreferences.showTrail ?? this.config.visual_show_trail;
     this.showAge = this.layerPreferences.showAge ?? this.config.visual_show_radar_age;
+    this.showPotential = this.layerPreferences.showPotential ?? this.config.visual_show_potential;
     this.trailStyle = this.layerPreferences.trailStyle ?? this.config.visual_trail_style;
     this.visits = new SparseVisitGrid(this.scene.world_bounds || [0,0,300000,300000],this.config.visual_grid_cell_size);
     this.visits.update(this.frames,this.index);this.dirty = true;
@@ -124,6 +126,7 @@ export class MaritimeMap {
     this.drawGrid(bounds);
     if (this.showAge) this.drawCoverage();
     if (this.showGrid) this.drawVisitGrid(bounds);
+    if (this.showPotential) this.drawPotential();
     this.drawObstacles(this.scene.islands || [], 'island');
     this.drawObstacles(this.scene.clouds || [], 'cloud');
     this.drawTrails();
@@ -135,6 +138,27 @@ export class MaritimeMap {
     document.getElementById('scale-label').textContent = `${km >= 1 ? km.toFixed(km % 1 ? 1 : 0) : km.toFixed(2)} km`;
     document.getElementById('coordinate').textContent = `X ${(this.center[0]/1000).toFixed(1)} · Y ${(this.center[1]/1000).toFixed(1)} km`;
     c.restore();
+  }
+  drawPotential() {
+    const field=this.frame?.potential;
+    if(!field?.values?.length||!Array.isArray(field.bounds))return;
+    const c=this.ctx,b=field.bounds,rows=field.values.length,cols=field.values[0].length;
+    if(this.scene.roi){
+      const roi=this.scene.roi,p=this.xy(roi[0],roi[3]),q=this.xy(roi[2],roi[1]);
+      c.save();c.beginPath();c.rect(0,0,this.width,this.height);c.rect(p[0],p[1],q[0]-p[0],q[1]-p[1]);c.fillStyle='#cd71ae0c';c.fill('evenodd');c.restore();
+    }
+    for(let row=0;row<rows;row++)for(let col=0;col<cols;col++) {
+      const color=potentialColor(field.values[row][col],field.valid?.[row]?.[col]!==0);
+      if(!color[3])continue;
+      const rect=potentialCellBounds(field,row,col,this.scene.roi);
+      if(!rect)continue;
+      const p=this.xy(rect[0],rect[3]),q=this.xy(rect[2],rect[1]);
+      const overlap=this.scene.roi&&field.values[row][col]>0?0:.3;
+      c.fillStyle=`rgba(${color.join(',')})`;c.fillRect(p[0],p[1],q[0]-p[0]+overlap,q[1]-p[1]+overlap);
+    }
+    const p=this.frame.uav,r=field.radius||this.scene.config_snapshot?.potential_radius;
+    if(p&&r){const a=this.xy(p.x,p.y);c.strokeStyle='#e9f0e466';c.lineWidth=1;c.setLineDash([3,5]);c.beginPath();c.arc(a[0],a[1],r*this.scale,0,2*Math.PI);c.stroke();c.setLineDash([]);}
+    if(field.goal?.length===2){const a=this.xy(...field.goal);c.strokeStyle='#a2f5c5';c.lineWidth=1.5;c.beginPath();c.arc(a[0],a[1],5,0,2*Math.PI);c.moveTo(a[0]-9,a[1]);c.lineTo(a[0]+9,a[1]);c.moveTo(a[0],a[1]-9);c.lineTo(a[0],a[1]+9);c.stroke();}
   }
   niceStep(value) {
     const scale = 10 ** Math.floor(Math.log10(Math.max(value, .001)));

@@ -58,6 +58,29 @@ class Config:
     tracking_half_angle: float = math.radians(30)
     pan_limit: float = math.radians(120)
     max_pan_rate: float = math.radians(30)
+    potential_enabled: bool = False
+    potential_radius: float = 6000.
+    potential_period: float = 3600.
+    potential_decay: float = 3.
+    coverage_pan_limit: float = math.pi / 3
+    potential_goal_hold_seconds: float = 180.
+    potential_goal_radius: float = 1500.
+    potential_unseen_bonus: float = 2.
+    field_heading_offsets: tuple = (0., -.18, .18, -.36, .36)
+    field_prediction_seconds: float = 8.
+    field_path_samples: int = 4
+    field_guidance_weight: float = 2.
+    field_scan_weight: float = 1.4
+    field_preference_weight: float = .2
+    field_roi_weight: float = .3
+    field_turn_weight: float = .05
+    field_obstacle_weight: float = 1.
+    field_obstacle_influence: float = 2500.
+    field_tracking_repulsion_limit: float = .12
+    field_pan_samples: int = 9
+    field_pan_goal_weight: float = .6
+    field_pan_slew_weight: float = .05
+    visual_show_potential: bool = True
     tracking_desired_distance: float = 2000.
     tracking_initial_min_distance: float = 1600.
     tracking_initial_max_distance: float = 2400.
@@ -160,9 +183,12 @@ class Config:
                 if isinstance(value,bool) or int(value)!=value:raise ValueError(f'{field.name} must be an integer')
                 setattr(self,field.name,int(value))
         self.expert_safety_heading_offsets=tuple(float(v) for v in self.expert_safety_heading_offsets)
+        self.field_heading_offsets=tuple(float(v) for v in self.field_heading_offsets)
+        if not self.field_heading_offsets or not all(math.isfinite(v) and abs(v)<=math.pi for v in self.field_heading_offsets):
+            raise ValueError('Field heading offsets must be finite angles in [-pi,pi]')
         if not self.expert_safety_heading_offsets or not all(math.isfinite(v) and abs(v)<=math.pi for v in self.expert_safety_heading_offsets):
             raise ValueError('Safety heading offsets must be finite angles in [-pi,pi]')
-        nonnegative={'cloud_min_count','cloud_max_count','island_min_count','island_max_count','uav_cloud_margin','ship_island_margin','tracking_range_guard','tracking_angle_guard','roi_outer_buffer','expert_obstacle_buffer'}
+        nonnegative={'cloud_min_count','cloud_max_count','island_min_count','island_max_count','uav_cloud_margin','ship_island_margin','tracking_range_guard','tracking_angle_guard','roi_outer_buffer','expert_obstacle_buffer','potential_unseen_bonus','field_tracking_repulsion_limit','field_guidance_weight','field_scan_weight','field_preference_weight','field_roi_weight','field_turn_weight','field_obstacle_weight','field_pan_goal_weight','field_pan_slew_weight'}
         for field in fields(self):
             value=getattr(self,field.name)
             if isinstance(value,bool) or not isinstance(value,(int,float)) or field.name=='coverage_offset':continue
@@ -177,6 +203,8 @@ class Config:
             raise ValueError('visual_trail_style must be meteor or full')
         if not 0<self.coverage_half_angle<math.pi/2 or not 0<self.tracking_half_angle<math.pi/2 or not 0<self.pan_limit<math.pi:
             raise ValueError('Invalid radar angular limits')
+        if not 0<self.coverage_pan_limit<math.pi:
+            raise ValueError('coverage_pan_limit must be in (0,pi)')
         if self.ship_route_spacing>25:raise ValueError('ship_route_spacing may not exceed25m')
         if 64 % self.coverage_planning_blocks:raise ValueError('coverage_planning_blocks must divide64')
         if self.expert_safety_projection_dt>self.expert_safety_horizon:raise ValueError('Safety projection dt exceeds horizon')

@@ -1,7 +1,9 @@
 """Versioned NPZ episode reading and deterministic splitting by complete scenes.
 
 NPZ stores ``vector[T+1,N]``, optional ``coverage_map[T+1,3,64,64]``,
-``actions[T,2]`` and ``executed_actions[T,2]``. ``metadata`` is scalar JSON.
+``actions[T,2]`` and ``executed_actions[T,2]``. Field-v2 instead stores
+``potential[T+1,4,33,33]``, ``field_context[T+1,16]``, ``actions[T,3]``
+with explicit dataset/observation/action schema metadata. ``metadata`` is JSON.
 Only expert command ``actions`` are imitation labels. Whole episodes are loaded
 on demand; training processes their contiguous chunks while carrying GRU state.
 """
@@ -13,6 +15,24 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+FIELD_OBSERVATION_SCHEMA = "obs-field-v2"
+FIELD_ACTION_SCHEMA = "action-field-v2"
+FIELD_DATASET_VERSION = "bc-dataset-field-v2"
+
+
+def _validate_protocol(metadata, observation_schema, path):
+    schema = metadata.get("observation_schema", metadata.get("obs_schema", metadata.get("schema_version", "obs-v1")))
+    if schema != observation_schema:
+        raise ValueError(f"episode {path} observation schema/protocol {schema} does not match {observation_schema}")
+    if observation_schema == FIELD_OBSERVATION_SCHEMA:
+        if metadata.get("dataset_version") != FIELD_DATASET_VERSION:
+            raise ValueError(f"episode {path} requires dataset version {FIELD_DATASET_VERSION}")
+        if metadata.get("action_schema") != FIELD_ACTION_SCHEMA:
+            raise ValueError(f"episode {path} action schema must be {FIELD_ACTION_SCHEMA}")
+        if "obs_schema" in metadata and metadata["obs_schema"] != observation_schema:
+            raise ValueError(f"episode {path} has conflicting observation schemas")
 
 
 def read_episode_metadata(path):
@@ -29,7 +49,7 @@ def read_episode_metadata(path):
     return metadata
 
 
-def split_episodes(dataset_dir, task, validation_fraction=.2, seed=0):
+def split_episodes(dataset_dir, task, validation_fraction=.2, seed=0, observation_schema="obs-v1"):
     """Return manifests; repeated static-layout groups remain together.
 
     scene_group_id (layout, independent of initial state) takes precedence over
@@ -86,6 +106,7 @@ def split_episodes(dataset_dir, task, validation_fraction=.2, seed=0):
             if source_manifest is not None:
                 raise ValueError(f"accepted manifest includes an invalid expert episode: {path}")
             continue
+        _validate_protocol(metadata, observation_schema, path)
         scene_id = metadata.get("scene_id", metadata.get("scene_hash"))
         group_id = metadata.get("scene_group_id", scene_id)
         if group_id is None:
@@ -119,7 +140,7 @@ def split_episodes(dataset_dir, task, validation_fraction=.2, seed=0):
 class SequenceDataset(Dataset):
     """One item is one whole episode, preserving history and label alignment."""
 
-    def __init__(self, paths, task=None):
+    def __init__(self, paths, task=None, observation_schema="obs-v1"):
         if isinstance(paths, (str, Path)):
             manifest = json.loads(Path(paths).read_text(encoding="utf-8"))
             paths = manifest.get("paths", manifest.get("train_paths", []))
@@ -129,6 +150,10 @@ class SequenceDataset(Dataset):
         self.paths = [Path(path) for path in paths]
         self.task = task
         self.vector_dim = 111 if task == "coverage" else 134
+        if observation_schema not in {"obs-v1", FIELD_OBSERVATION_SCHEMA}:
+            raise ValueError("unsupported observation schema")
+        self.observation_schema = observation_schema
+        self.action_dim = 3 if observation_schema == FIELD_OBSERVATION_SCHEMA else 2
 
     def __len__(self):
         return len(self.paths)
@@ -138,28 +163,40 @@ class SequenceDataset(Dataset):
         metadata = read_episode_metadata(path)
         if metadata.get("task") != self.task:
             raise ValueError(f"episode {path} has the wrong task")
+        _validate_protocol(metadata, self.observation_schema, path)
         with np.load(path, allow_pickle=False) as data:
             if "actions" not in data or "vector" not in data:
                 raise ValueError(f"episode {path} is missing vector or actions")
             actions = np.asarray(data["actions"], dtype=np.float32)
             vector = np.asarray(data["vector"], dtype=np.float32)
-            if actions.ndim != 2 or actions.shape[1] != 2 or len(actions) < 1:
-                raise ValueError(f"episode {path} actions must have nonempty shape (T,2)")
+            if actions.ndim != 2 or actions.shape[1] != self.action_dim or len(actions) < 1:
+                raise ValueError(f"episode {path} actions must have nonempty shape (T,{self.action_dim})")
             length = len(actions)
             if vector.shape != (length + 1, self.vector_dim):
                 raise ValueError(f"episode {path} vector must have shape (T+1,{self.vector_dim})")
             if not np.isfinite(vector).all() or not np.isfinite(actions).all():
                 raise ValueError(f"episode {path} observations and labels must be finite")
-            norms = np.linalg.norm(actions, axis=-1)
+            norms = np.linalg.norm(actions[:, :2], axis=-1)
             if np.any(np.abs(actions) > 1 + 1e-6) or not np.allclose(norms, 1, atol=1e-4):
                 raise ValueError(f"episode {path} expert actions must be unit XY directions")
             result = dict(vector=torch.from_numpy(vector[:-1].copy()),
                           actions=torch.from_numpy(actions.copy()))
             if "executed_actions" in data:
                 executed = data["executed_actions"]
-                if executed.shape != actions.shape or not np.isfinite(executed).all():
-                    raise ValueError(f"episode {path} executed_actions must be finite shape (T,2)")
-            if self.task == "coverage":
+                valid_shapes = {(length, self.action_dim)}
+                if self.action_dim == 3:
+                    valid_shapes.add((length, 2))
+                if executed.shape not in valid_shapes or not np.isfinite(executed).all():
+                    raise ValueError(f"episode {path} executed_actions has incompatible shape or nonfinite values")
+            if self.observation_schema == FIELD_OBSERVATION_SCHEMA:
+                for key, shape in [("potential", (4, 33, 33)), ("field_context", (16,))]:
+                    if key not in data:
+                        raise ValueError(f"episode {path} is missing {key}")
+                    array = np.asarray(data[key], dtype=np.float32)
+                    if array.shape != (length + 1, *shape) or not np.isfinite(array).all():
+                        raise ValueError(f"episode {path} {key} must be finite shape {(length + 1, *shape)}")
+                    result[key] = torch.from_numpy(array[:-1].copy())
+            elif self.task == "coverage":
                 if "coverage_map" not in data:
                     raise ValueError(f"episode {path} is missing coverage_map")
                 coverage_map = np.asarray(data["coverage_map"], dtype=np.float32)

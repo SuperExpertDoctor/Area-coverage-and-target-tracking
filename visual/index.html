@@ -40,6 +40,7 @@
         <div class="layer-toolbar" aria-label="图层与轨迹显示">
           <label title="按UAV实际经过位置记录，离开后按仿真时间渐淡，不表示雷达覆盖"><input id="show-grid" type="checkbox" checked>经过网格</label>
           <label title="独立的雷达扫描信息年龄图层"><input id="show-age" type="checkbox" checked>雷达覆盖年龄</label>
+          <label title="局部场：云 -2，已扫及区外 -1，待扫 +1；随信息价值失效周期 T 指数恢复"><input id="show-potential" type="checkbox" checked>局部引斥场</label>
           <span class="layer-separator"></span>
           <label><input id="show-trail" type="checkbox" checked>轨迹</label>
           <label class="sr-only" for="trail-style">轨迹样式</label><select id="trail-style"><option value="meteor">流星尾迹 · 60s</option><option value="history">完整历史</option></select>
@@ -54,6 +55,7 @@
           <div class="map-legend"><span><i class="legend-line uav"></i>无人机</span><span><i class="legend-line ship"></i>科考船</span><span><i class="legend-sector"></i>雷达视场</span><span id="visit-key"><i class="legend-visit"></i>经过：新深 → 旧浅</span></div>
           <div class="scale-bar"><i id="scale-line"></i><span id="scale-label">50 km</span></div>
           <div class="age-key" id="age-key"><span>雷达近期观测</span><i></i><span>陈旧 / 未覆盖</span></div>
+          <div id="potential-key" class="potential-key" hidden><span>−2 雷云</span><span>−1 斥力</span><span>+1 引力</span></div>
         </div>
         <div class="map-bottom"><span><i class="air-dot"></i>云区：空中禁入 <b id="cloud-count">—</b></span><span><i class="sea-dot"></i>岛屿：海面禁入 <b id="island-count">—</b></span><span class="map-hint">拖动平移 · 滚轮缩放</span></div>
       </section>
@@ -81,6 +83,14 @@
       <label class="sr-only" for="speed">回放速度</label><select id="speed" class="speed-select"><option value="1">1×</option><option value="5">5×</option><option value="20">20×</option><option value="60" selected>60×</option><option value="120">120×</option></select>
       <div class="frame-count" id="frame-count">0 帧</div>
     </section>
+    <section class="recording-bar" aria-label="任务画面录制">
+      <div class="recording-label"><i aria-hidden="true"></i><span>任务录像</span><small id="recording-settings">读取录制设置…</small></div>
+      <button id="record-start" class="record-button" disabled>开始录制</button>
+      <button id="record-stop" class="record-button secondary" disabled>停止并保存</button>
+      <output id="recording-status" role="status" aria-live="polite">准备录制</output>
+      <a id="recording-download" hidden download>下载 MP4 ↗</a>
+    </section>
+    <div id="run-status" class="run-status" role="status" aria-live="polite" hidden></div>
     <footer class="status-bar"><span id="status" role="status" aria-live="polite">正在读取本地回放记录…</span><span>坐标与距离使用米制 · 所有指标来自仿真</span></footer>
   </div>
   <script type="module" src="/app.js"></script>

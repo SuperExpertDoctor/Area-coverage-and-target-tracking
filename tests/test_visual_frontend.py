@@ -159,3 +159,84 @@ def test_actual_renderer_keeps_radar_physical_and_rotates_small_models():
       map.setVisualConfig({visual_uav_min_pixels:120});map.drawRadar();
       assert.equal(arcs.at(-1)[2],60);
     """)
+
+
+def run_app_js(script):
+    """Exercise real app status/catalog code without starting a server or browser."""
+    harness = """
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs';
+      import vm from 'node:vm';
+      class Element {
+        constructor(){this.textContent='';this.value='';this.children=[];this.style={};this.classList={toggle(){}};this.listeners={};}
+        get parentElement(){return this;}
+        addEventListener(name,fn){this.listeners[name]=fn;}
+        setAttribute(){}
+        querySelector(){return new Element();}
+        replaceChildren(){this.children=[];}
+        append(node){this.children.push(node);}
+      }
+      const elements=new Map();
+      const document={getElementById(id){if(!elements.has(id))elements.set(id,new Element());return elements.get(id);},querySelectorAll:()=>[],createElement:()=>new Element()};
+      class MaritimeMap {
+        constructor(){this.config={visual_trail_seconds:60,visual_grid_cell_size:250,visual_grid_fade_seconds:600};}
+        setScene(){} setView(){}
+      }
+      const context=vm.createContext({document,MaritimeMap,Map,Number,Math,performance:{now:()=>0},window:{addEventListener(){}},ResizeObserver:class{observe(){}},setInterval(){},fetch:async()=>({ok:true,json:async()=>({replays:[]})}),formatTime:()=> '01:00'});
+      const source=fs.readFileSync('visual/app.js','utf8').replace(/^import .*$/gm,'').replace('updateChoices();activateReplay(null);loadVisualConfig();refreshCatalog(true);connectLive();requestAnimationFrame(tick);','');
+      vm.runInContext(source,context);
+      const execute=code=>vm.runInContext(code,context);
+    """
+    result = subprocess.run([NODE, '--input-type=module', '-e', harness+script],
+                            cwd=ROOT, capture_output=True, text=True, encoding='utf-8', timeout=15)
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_constrained_policy_is_identified_in_history_and_live_status_and_catalog():
+    run_app_js("""
+      for(const mode of ['history','live']){
+        execute(`state.mode='${mode}';state.actor='policy';activateReplay({metadata:{control_mode:'forecast_constraint'},frames:[{t:0}],scene:{}},'constraint.json')`);
+        assert(elements.get('status').textContent.includes('行为克隆网络 + 显式物理约束'));
+      }
+      execute("state.mode='history';state.records=[{name:'constraint.json',url:'c',task:'coverage',actor:'policy',control_mode:'forecast_constraint',frames:2,duration:60}];renderCatalog()");
+      assert(elements.get('replay-select').children[0].textContent.includes('行为克隆网络 + 显式物理约束'));
+      execute("activateReplay({metadata:{},frames:[{t:0}],scene:{}},'pure.json')");
+      assert(!elements.get('status').textContent.includes('显式物理约束'));
+      execute("activateReplay({metadata:{behavior:'dagger_training',mixture_beta:0.5},frames:[{t:0}],scene:{}},'dagger.json')");
+      assert(elements.get('status').textContent.includes('DAgger训练混合控制 β=0.5'));
+      assert(!elements.get('status').textContent.includes('显式物理约束'));
+      execute("state.records=[{name:'pure.json',url:'p',task:'coverage',actor:'policy',frames:2,duration:60},{name:'dagger.json',url:'d',task:'coverage',actor:'policy',behavior:'dagger_training',frames:2,duration:60}];renderCatalog()");
+      assert.equal(elements.get('replay-select').children[0].textContent,'pure.json · 01:00 · 2 帧');
+      assert.equal(elements.get('replay-select').children[1].textContent,'dagger.json [DAgger训练混合] · 01:00 · 2 帧');
+      assert.equal(execute('state.actor'),'policy');
+    """)
+
+
+def test_local_import_and_catalog_refresh_keep_constraint_disclosure():
+    run_app_js("""
+      context.validateReplay=data=>data;
+      context.file={name:'local-constraint.json',text:async()=>JSON.stringify({task:'coverage',actor:'policy',metadata:{control_mode:'forecast_constraint'},scene:{},frames:[{t:0}]})};
+      await execute("document.getElementById('replay-file').listeners.change({target:{files:[file]}})");
+      assert(elements.get('replay-select').children[0].textContent.includes('行为克隆网络 + 显式物理约束'));
+      await execute('refreshCatalog(false)');
+      assert(elements.get('replay-select').children[0].textContent.includes('行为克隆网络 + 显式物理约束'));
+    """)
+
+
+def test_recording_mime_detection_and_real_timeline_endpoints():
+    script = """
+      import assert from 'node:assert/strict';
+      import {recordingMime, timelineTime, replayProvenance} from './visual/recording.js';
+      assert.equal(recordingMime({isTypeSupported:t=>t==='video/webm;codecs=vp8'}),'video/webm;codecs=vp8');
+      assert.throws(()=>recordingMime({isTypeSupported:()=>false}),/recording format/i);
+      assert.equal(timelineTime(0,30,0,10800,24),0);
+      assert.equal(timelineTime(30-1/24,30,0,10800,24),10800);
+      assert.equal(timelineTime(45,30,0,1800,24),1800);
+      const provenance=replayProvenance({task:'coverage',actor:'policy',metadata:{model_sha256:'abc',control_mode:'forecast_constraint'},summary:{terminated:true,termination_reason:'collision'},frames:[{t:0},{t:123}]});
+      assert.equal(provenance.control_mode,'forecast_constraint');
+      assert.equal(provenance.simulation_end_seconds,123);
+      assert.equal(provenance.outcome.termination_reason,'collision');
+    """
+    result = subprocess.run([NODE, '--input-type=module', '-e', script], cwd=ROOT,
+                            capture_output=True, text=True, encoding='utf-8', timeout=15)
+    assert result.returncode == 0, result.stderr

@@ -1,10 +1,12 @@
 import {MaritimeMap, finite, position, speedOf, headingDegrees} from './map.js';
 import {validateReplay, frameAtTime, formatTime} from './replay.js';
+import {MissionRecorder} from './recording.js';
 
 const $ = id => document.getElementById(id);
 const map = new MaritimeMap($('map'));
-const state = {task:'coverage',actor:'expert',mode:'history',records:[],localReplays:new Map(),replay:null,index:0,playing:false,time:0,speed:60,live:new Map(),liveKey:null,loadToken:0,connected:false,catalogLoading:false};
-const actorName = actor => actor === 'expert' ? '专家策略' : '行为克隆网络';
+const state = {task:'coverage',actor:'expert',mode:'history',records:[],localReplays:new Map(),replay:null,index:0,playing:false,time:0,speed:60,live:new Map(),liveKey:null,loadToken:0,connected:false,catalogLoading:false,recording:false};
+const actorName = (actor, metadata) => actor === 'expert' ? '专家策略' : metadata?.control_mode === 'forecast_constraint' ? '行为克隆网络 + 显式物理约束' : '行为克隆网络';
+const localReplayRecord = (url, replay, name) => ({url,name:`本地导入 / ${name}`,task:replay.task,actor:replay.actor,frames:replay.frames.length,duration:replay.frames.at(-1)?.t||0,behavior:replay.metadata?.behavior,control_mode:replay.metadata?.control_mode});
 const taskName = task => task === 'coverage' ? '区域覆盖' : '协同跟踪';
 const numeric = (value, digits=0) => Number.isFinite(value) ? value.toFixed(digits) : '—';
 const radians = value => Number.isFinite(value) ? value*180/Math.PI : NaN;
@@ -16,6 +18,8 @@ function scheduleRender() { renderQueued = true; trendDirty = true; }
 function updateLayerControls() {
   $('show-grid').checked=map.showGrid;$('show-trail').checked=map.showTrail;
   $('show-age').checked=map.showAge;$('show-age').parentElement.hidden=state.task!=='coverage';
+  $('show-potential').checked=map.showPotential;
+  $('potential-key').hidden=!map.showPotential||!state.replay?.frames?.[state.index]?.potential;
   $('age-key').hidden=state.task!=='coverage'||!map.showAge;
   $('trail-style').value=map.trailStyle;$('trail-style').disabled=!map.showTrail;
   $('trail-style').querySelector('[value="meteor"]').textContent=`流星尾迹 · ${map.config.visual_trail_seconds}s`;
@@ -80,7 +84,7 @@ function activateReplay(replay, name='实时仿真') {
   if(replay){
     const training=replay.metadata?.behavior==='dagger_training'?` · DAgger训练混合控制 β=${replay.metadata.mixture_beta}`:'';
     const failure=replay.summary?.terminated?` · 失败终止：${replay.summary.termination_reason||'planning_failure'}`:'';
-    status(`${state.mode==='live'?'实时':'回放'} · ${taskName(state.task)} / ${actorName(state.actor)} · ${name}${training}${failure}`);
+    status(`${state.mode==='live'?'实时':'回放'} · ${taskName(state.task)} / ${actorName(state.actor,replay.metadata)} · ${name}${training}${failure}`);
   }
   scheduleRender();updateChoices();
 }
@@ -91,7 +95,8 @@ function renderCatalog() {
   if(!records.length){const option=document.createElement('option');option.value='';option.textContent='暂无该任务与策略的回放记录';$('replay-select').append(option);return records;}
   for(const record of records){
     const option=document.createElement('option');option.value=record.url;
-    option.textContent=`${record.name}${record.behavior==='dagger_training'?' [DAgger训练混合]':''} · ${formatTime(record.duration)} · ${record.frames} 帧`;
+    const constrained=record.actor!=='expert'&&record.control_mode==='forecast_constraint'?` [${actorName(record.actor,record)}]`:'';
+    option.textContent=`${record.name}${constrained}${record.behavior==='dagger_training'?' [DAgger训练混合]':''} · ${formatTime(record.duration)} · ${record.frames} 帧`;
     option.title=record.name;$('replay-select').append(option);
   }
   if(records.some(r=>r.url===selected))$('replay-select').value=selected;
@@ -105,9 +110,9 @@ async function refreshCatalog(autoLoad=false) {
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const data=await response.json();
     const remote=Array.isArray(data)?data:data.replays||[];
-    state.records=[...Array.from(state.localReplays,([url,entry])=>({url,name:`本地导入 / ${entry.name}`,task:entry.replay.task,actor:entry.replay.actor,frames:entry.replay.frames.length,duration:entry.replay.frames.at(-1)?.t||0})),...remote];
+    state.records=[...Array.from(state.localReplays,([url,entry])=>localReplayRecord(url,entry.replay,entry.name)),...remote];
     const records=renderCatalog();
-    if(autoLoad&&state.mode==='history'&&!state.replay){
+    if(autoLoad&&state.mode==='history'&&!state.replay&&!state.deepLink){
       if(records.length)await loadReplay($('replay-select').value);
       else {status('暂无已生成回放；运行专家采集或策略评估后，记录会自动显示。');$('empty-message').textContent='运行仿真生成回放，或通过「导入 JSON」打开本地记录。';}
     }
@@ -152,6 +157,7 @@ function render() {
   renderQueued=false;
   const replay=state.replay,frames=replay?.frames||[],frame=frames[state.index],coverage=frame?.coverage||{},radar=frame?.radar||{},metrics=frame?.metrics||{};
   const hasFrame=Boolean(frame);
+  $('potential-key').hidden=!map.showPotential||!frame?.potential;
   $('empty-state').hidden=hasFrame;
   $('data-label').textContent=hasFrame?(state.mode==='live'?'LIVE':'REPLAY'):'无数据';
   $('data-label').style.color=hasFrame?'var(--cyan)':'';
@@ -181,9 +187,9 @@ function render() {
   $('timeline-middle').textContent=frames.length?formatTime((frames[0].t+frames.at(-1).t)/2):'—';
   $('timeline-end').textContent=frames.length?formatTime(frames.at(-1).t):'终点';
   $('seek').max=Math.max(0,frames.length-1);$('seek').value=state.index;
-  $('seek').disabled=!hasFrame||state.mode==='live';
+  $('seek').disabled=!hasFrame||state.mode==='live'||state.recording;
   $('seek').style.setProperty('--progress',`${frames.length>1?state.index/(frames.length-1)*100:0}%`);
-  $('play').disabled=!hasFrame||state.mode==='live';$('restart').disabled=!hasFrame||state.mode==='live';$('speed').disabled=state.mode==='live';
+  $('play').disabled=!hasFrame||state.mode==='live'||state.recording;$('restart').disabled=!hasFrame||state.mode==='live'||state.recording;$('speed').disabled=state.mode==='live'||state.recording;
   $('frame-count').textContent=hasFrame?`${state.index+1} / ${frames.length} 帧`:'0 帧';
   map.setFrame(frame,frames,state.index);
   if(trendDirty)drawTrend();
@@ -218,6 +224,7 @@ function connectLive() {
   source.onmessage=event=>{
     try {
       const data=JSON.parse(event.data);
+      if(data.type==='run_status'){displayRunStatus(typeof data.status==='object'?data.status:data.run_status||data);return;}
       if(data.type==='scene'){
         const task=data.task||data.scene?.task||'coverage',actor=data.actor==='network'?'policy':data.actor||'expert',key=keyFor(task,actor);
         const replay={task,actor,scene:data.scene||{},seed:data.seed??data.scene?.seed,metadata:data.metadata||{},frames:[]};
@@ -252,7 +259,7 @@ $('replay-file').addEventListener('change',async event=>{
   try {
     const replay=validateReplay(JSON.parse(await file.text()));++state.loadToken;state.mode='history';state.task=replay.task;state.actor=replay.actor;
     const url=`local:${Date.now()}:${file.name}`;state.localReplays.set(url,{replay,name:file.name});
-    state.records.unshift({url,name:`本地导入 / ${file.name}`,task:replay.task,actor:replay.actor,frames:replay.frames.length,duration:replay.frames.at(-1)?.t||0});
+    state.records.unshift(localReplayRecord(url,replay,file.name));
     renderCatalog();$('replay-select').value=url;activateReplay(replay,file.name);
   }
   catch(error){status(`导入失败：${error.message}`);}
@@ -271,6 +278,7 @@ document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener
 }));
 $('zoom-in').addEventListener('click',()=>map.adjustZoom(1.4));$('zoom-out').addEventListener('click',()=>map.adjustZoom(1/1.4));$('reset-view').addEventListener('click',()=>map.reset());
 $('show-age').addEventListener('change',()=>{map.setLayerOptions({showAge:$('show-age').checked});updateLayerControls();});
+$('show-potential').addEventListener('change',()=>{map.setLayerOptions({showPotential:$('show-potential').checked});updateLayerControls();});
 $('show-grid').addEventListener('change',()=>{map.setLayerOptions({showGrid:$('show-grid').checked});updateLayerControls();});
 $('show-trail').addEventListener('change',()=>{map.setLayerOptions({showTrail:$('show-trail').checked});updateLayerControls();});
 $('trail-style').addEventListener('change',()=>map.setLayerOptions({trailStyle:$('trail-style').value}));
@@ -283,7 +291,7 @@ window.addEventListener('keydown',event=>{
 let previous=performance.now();
 function tick(now) {
   const elapsed=Math.min((now-previous)/1000,.25);previous=now;
-  if(state.playing&&state.replay?.frames.length){
+  if(!state.recording&&state.playing&&state.replay?.frames.length){
     const frames=state.replay.frames;state.time+=elapsed*state.speed;
     const index=frameAtTime(frames,state.time);
     if(index!==state.index){state.index=index;scheduleRender();}
@@ -292,4 +300,55 @@ function tick(now) {
   if(renderQueued)render();map.draw();requestAnimationFrame(tick);
 }
 updateChoices();activateReplay(null);loadVisualConfig();refreshCatalog(true);connectLive();requestAnimationFrame(tick);
+if(typeof location!=='undefined')initializeRecording();
 setInterval(()=>refreshCatalog(state.mode==='history'&&!state.replay),15000);
+
+function displayRunStatus(run) {
+  if(!run?.phase)return;
+  const current=run.tasks?.[run.task]||{},collection=current.collection||{},training=current.training||{};
+  const details=[run.run_name,run.phase,run.task];
+  if(collection.target)details.push(`采集 ${collection.accepted||0}/${collection.target}`);
+  if(training.epoch!=null)details.push(`Epoch ${training.epoch}/${training.epochs??'—'}`);
+  if(Number.isFinite(training.train_loss))details.push(`train ${training.train_loss.toFixed(5)}`);
+  if(Number.isFinite(training.validation_loss))details.push(`val ${training.validation_loss.toFixed(5)}`);
+  if(run.error)details.push(String(run.error));
+  $('run-status').textContent=details.filter(Boolean).join(' · ');$('run-status').hidden=false;
+  $('run-status').dataset.error=Boolean(run.error);
+}
+
+function initializeRecording() {
+  const snapshot=()=>({replay:state.replay,frame:state.replay?.frames[state.index],mode:state.mode});
+  const recorder=new MissionRecorder({canvas:$('map'),snapshot,
+    seek:time=>{state.time=time;state.index=frameAtTime(state.replay.frames,time);render();map.draw();},
+    freeze:active=>{
+      state.recording=active;setPlaying(false);
+      document.querySelectorAll('.source-bar button,.source-bar select,.source-bar input,.task-tab,.playback button,.playback input,.playback select').forEach(control=>control.disabled=active);
+      if(!active){updateChoices();scheduleRender();}
+    },
+    onState:({status,message,active,result})=>{
+      $('recording-status').textContent=message;$('recording-status').dataset.state=status;
+      $('record-start').disabled=active||status==='loading'||status==='preparing'||status==='saving'||!recorder?.config;
+      $('record-stop').disabled=!active;
+      $('recording-download').hidden=!result;
+      if(result){$('recording-download').href=result.url;$('recording-download').download=result.path.split(/[\\/]/).pop();}
+    }});
+  const reportError=error=>recorder.fail(error);
+  $('record-start').addEventListener('click',()=>recorder.start({fullReplay:state.mode==='history'}).catch(reportError));
+  $('record-stop').addEventListener('click',()=>recorder.stop());
+  const load=async url=>{
+    const resolved=new URL(url,location.href);
+    if(resolved.origin!==location.origin||!resolved.pathname.startsWith('/outputs/'))throw new Error('Replay URL must be same-origin under /outputs/');
+    state.deepLink=true;state.mode='history';await loadReplay(resolved.pathname+resolved.search);
+    if(!state.replay?.frames?.length)throw new Error($('status').textContent);
+    render();map.draw();return {task:state.replay.task,actor:state.replay.actor,frames:state.replay.frames.length};
+  };
+  window.maritimeRecording={recorder,ready:recorder.ready,load,
+    info:()=>({status:recorder.status,error:recorder.error,result:recorder.result,...snapshot()}),
+    recordReplay:async options=>{await recorder.start({fullReplay:true,...options});return recorder.completion;},
+    stop:()=>recorder.stop()};
+  recorder.ready.then(config=>{if(config)$('recording-settings').textContent=`${config.recording_width} × ${config.recording_height} · ${config.recording_fps} FPS · ${config.recording_duration_seconds}s`;
+    const replayUrl=new URLSearchParams(location.search).get('replay');if(replayUrl)load(replayUrl).catch(reportError);
+  });
+  if(new URLSearchParams(location.search).has('replay'))state.deepLink=true;
+  fetch('/api/run-status',{cache:'no-store'}).then(r=>r.ok?r.json():{}).then(displayRunStatus).catch(()=>{});
+}

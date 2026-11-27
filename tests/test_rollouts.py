@@ -131,6 +131,79 @@ def test_live_dagger_scene_identifies_training_mixture(tmp_path):
     assert deployment.events[0].get('metadata', {}).get('behavior') != 'dagger_training'
 
 
+def test_constraint_rollout_keeps_raw_admitted_and_actual_commands_distinct(tmp_path):
+    module = importlib.import_module('rollouts')
+    from dataclasses import dataclass
+
+    @dataclass
+    class Configuration:
+        potential_enabled: bool = True
+        coverage_pan_limit: float = 1.
+
+    class Actor:
+        def __init__(self): self.count = 0
+        def reset(self): self.count = 0
+        @property
+        def execution_metadata(self):
+            return {'mode': 'forecast_constraint', 'checked_actions': self.count,
+                    'interventions': self.count, 'heuristic_constraint': True,
+                    'task_expert_fallback': False}
+        def act(self, obs):
+            self.count += 1
+            self.last_raw_action = np.array([1., 0., .2], np.float32)
+            self.last_intervened = True
+            return np.array([0., 1., .2], np.float32)
+
+    class Env:
+        task = 'coverage'
+        config = Configuration()
+        scene = {'world_bounds': [0, 0, 300000, 300000], 'roi': None,
+                 'clouds': [], 'islands': [], 'ship_route': []}
+        def reset(self, **kwargs): self.t = 0; return {'vector': np.zeros(111, np.float32)}, {}
+        def step(self, action):
+            np.testing.assert_array_equal(action, [0., 1., np.float32(.2)])
+            self.t += 1
+            return {'vector': np.zeros(111, np.float32)}, 0., False, True, {}
+        def render(self):
+            return {'t': self.t, 'uav': {'vx': .6, 'vy': .8}, 'radar': {'pan': .1}}
+        def summary(self): return {'time_seconds': self.t}
+
+    class Server:
+        def __init__(self): self.events = []
+        def publish(self, payload): self.events.append(payload)
+
+    server = Server()
+    record, path = module.run_episode(Env(), Actor(), seed=1, actor_name='policy',
+        output_dir=tmp_path, name='constraints', server=server)
+    assert record['metadata']['control_mode'] == 'forecast_constraint'
+    assert record['metadata']['policy_constraints']['interventions'] == 1
+    assert record['summary']['policy_constraints'] == record['metadata']['policy_constraints']
+    np.testing.assert_array_equal(record['raw_policy_actions'], [[1., 0., np.float32(.2)]])
+    np.testing.assert_array_equal(record['actions'], [[0., 1., np.float32(.2)]])
+    np.testing.assert_allclose(record['executed_actions'], [[.6, .8, .1]])
+    assert record['constraint_interventions'] == [True]
+    assert record['metadata']['expert_valid'] is False
+    assert not path.with_suffix('.npz').exists()
+    scene = server.events[0]
+    assert scene['metadata']['control_mode'] == 'forecast_constraint'
+    assert scene['metadata']['policy_constraints']['interventions'] == 0  # immutable initial snapshot
+    saved = json.loads(path.read_text(encoding='utf-8'))
+    assert saved['raw_policy_actions'] == record['raw_policy_actions']
+    index = json.loads(path.with_suffix('.replay-index.json').read_text(encoding='utf-8'))
+    assert index['entry']['control_mode'] == 'forecast_constraint'
+
+
+def test_constraint_layer_cannot_silently_enter_dagger_or_expert_collection(tmp_path):
+    module = importlib.import_module('rollouts')
+    class Actor:
+        execution_metadata = {'mode': 'forecast_constraint'}
+    class Env:
+        def reset(self, **kwargs): pytest.fail('reject ambiguous behavior before reset')
+    for kwargs in ({'actor_name': 'expert'}, {'actor_name': 'policy', 'expert_labeler': Actor()}):
+        with pytest.raises(ValueError, match='constraint'):
+            module.run_episode(Env(), Actor(), seed=1, output_dir=tmp_path, name='bad', **kwargs)
+
+
 @pytest.mark.parametrize('failure,dagger,accepted', [
     ('collision', True, True),
     ('tracking_loss', True, True),
@@ -211,3 +284,80 @@ def test_only_dagger_keeps_valid_labels_before_a_failed_behavior(tmp_path, failu
         with np.load(path.with_suffix('.npz'), allow_pickle=False) as before, np.load(restored, allow_pickle=False) as after:
             assert before.files == after.files
             assert all(np.array_equal(before[key], after[key]) for key in before.files)
+
+
+class _SparseEnv:
+    from dataclasses import make_dataclass
+    task = 'coverage'
+    config = make_dataclass('SparseConfig', [('decision_dt', float, 1.),
+        ('potential_enabled', bool, True), ('coverage_pan_limit', float, 1.)])()
+    scene = {'world_bounds': [0, 0, 300000, 300000], 'roi': None,
+             'clouds': [], 'islands': [], 'ship_route': []}
+
+    def __init__(self):
+        self.render_calls = 0
+        self.uav_model = self
+        self.uav = self
+
+    def velocity(self, state): return (.6, .8)
+    def observation(self): return {'vector': np.full(111, self.t, np.float32)}
+    def reset(self, **kwargs): self.t = 0; self.radar_pan = 0.; return self.observation(), {}
+    def step(self, action):
+        self.t += 1
+        self.radar_pan = self.t / 10
+        return self.observation(), 0., False, self.t == 7, {'time_seconds': self.t}
+    def render(self):
+        self.render_calls += 1
+        return {'t': self.t, 'uav': {'vx': .6, 'vy': .8},
+                'radar': {'pan': self.radar_pan}}
+    def summary(self): return {'time_seconds': self.t}
+
+
+class _SparseActor:
+    def reset(self): pass
+    def act(self, obs): return np.array([1., 0., obs['vector'][0] / 10], np.float32)
+
+
+def test_sparse_replay_preserves_all_training_labels_and_actual_actions(tmp_path):
+    module = importlib.import_module('rollouts')
+    full_env, sparse_env = _SparseEnv(), _SparseEnv()
+    full, _ = module.run_episode(full_env, _SparseActor(), seed=7, actor_name='expert',
+        output_dir=tmp_path, name='full', record_observations=True)
+    sparse, sparse_path = module.run_episode(sparse_env, _SparseActor(), seed=7, actor_name='expert',
+        output_dir=tmp_path, name='sparse', record_observations=True, replay_every=3)
+    assert sparse['frame_action_indices'] == [0, 3, 6, 7]
+    assert [frame['t'] for frame in sparse['frames']] == [0, 3, 6, 7]
+    assert sparse_env.render_calls == 4
+    assert full_env.render_calls == 8
+    assert sparse['actions'] == full['actions']
+    assert sparse['executed_actions'] == full['executed_actions']
+    assert sparse['observations'] == full['observations']
+    assert len(sparse['actions']) == 7
+    assert module.decode_array(sparse['observations']['vector']).shape == (8, 111)
+    restored = module.restore_training_cache(sparse_path, tmp_path / 'restored.npz')
+    with np.load(sparse_path.with_suffix('.npz')) as before, np.load(restored) as after:
+        for key in before.files:
+            np.testing.assert_array_equal(before[key], after[key])
+
+
+def test_sparse_replay_keeps_last_state_on_off_cadence_planning_failure(tmp_path):
+    module = importlib.import_module('rollouts')
+    class PlanningError(Exception): pass
+    class Actor(_SparseActor):
+        def act(self, obs):
+            if obs['vector'][0] == 2: raise PlanningError('no continuation')
+            return super().act(obs)
+    record, _ = module.run_episode(_SparseEnv(), Actor(), seed=1, actor_name='expert',
+        output_dir=tmp_path, name='failed-sparse', replay_every=5, record_observations=True)
+    assert record['frame_action_indices'] == [0, 2]
+    assert record['frames'][-1]['t'] == 2
+    assert record['summary']['planning_failure']['t'] == 2
+    assert record['metadata']['expert_valid'] is False
+
+
+@pytest.mark.parametrize('cadence', [1.5, True])
+def test_replay_cadence_requires_a_positive_integer(tmp_path, cadence):
+    module = importlib.import_module('rollouts')
+    with pytest.raises(ValueError, match='cadence'):
+        module.run_episode(_SparseEnv(), _SparseActor(), seed=1, actor_name='expert',
+            output_dir=tmp_path, name='invalid-cadence', replay_every=cadence)
