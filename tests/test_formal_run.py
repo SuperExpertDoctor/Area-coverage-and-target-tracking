@@ -71,6 +71,30 @@ def test_formal_protocol_rejects_collection_and_test_overlap():
         formal_protocol(args,Config(potential_enabled=True),['coverage'])
 
 
+def test_formal_protocol_survives_json_roundtrip_for_real_resume():
+    from main import parser
+    from config import Config
+    from src.formal_run import formal_protocol
+    args=parser().parse_args(['--mode','formal'])
+    protocol=formal_protocol(args,Config(potential_enabled=True),['coverage','tracking'])
+    assert protocol==json.loads(json.dumps(protocol))
+
+
+def test_formal_resume_accepts_its_persisted_protocol_before_preflight(tmp_path,monkeypatch):
+    from main import parser
+    from config import Config
+    from src import formal_run
+    args=parser().parse_args(['--mode','formal','--run-name','resume-test'])
+    args.output_dir=tmp_path
+    cfg=Config(potential_enabled=True)
+    formal_run.atomic_json(tmp_path/'formal-protocol.json',formal_run.formal_protocol(args,cfg,['tracking']))
+    class ReachedPreflight(Exception):pass
+    def stop(job,server):raise ReachedPreflight()
+    monkeypatch.setattr(formal_run,'_rollout',stop)
+    with pytest.raises(ReachedPreflight):
+        formal_run.run_formal(args,cfg,['tracking'],None,{})
+
+
 def test_failed_independent_case_retains_error_and_allows_other_cases(tmp_path,monkeypatch):
     from src import formal_run
     def broken(job):

@@ -82,7 +82,7 @@ def formal_protocol(args, config, tasks):
             raise ValueError('Final-test seeds overlap the expert collection attempt range')
         if args.expert_seed+(task == 'tracking') in range(test_start,test_start+args.formal_test_episodes):
             raise ValueError('Final-test seeds overlap expert preflight')
-    return dict(schema='maritime-formal-protocol-v1', episodes_per_task=args.episodes,
+    protocol=dict(schema='maritime-formal-protocol-v1', episodes_per_task=args.episodes,
         source_sha256=source.hexdigest(),
         validation_fraction=args.validation_fraction, latest_checkpoint_name='last.pt',
         test_outcomes_used_for_weight_selection=False,
@@ -104,6 +104,8 @@ def formal_protocol(args, config, tasks):
                                   + args.formal_test_episodes)),
             duration_seconds=(args.collection_coverage_seconds if task == 'coverage'
                               else args.collection_tracking_seconds)) for task in tasks})
+    # Config tuples and their persisted JSON lists have identical semantics.
+    return json.loads(json.dumps(protocol,allow_nan=False))
 
 
 class FormalStatus:

@@ -371,3 +371,6 @@ before the authorized old-output/log cleanup.
 代码于2df4d9c合并main并推送GitHub，远端SHA复核一致；合并结果与已审查分支内容相同，43项关键测试通过、1项Windows权限跳过。
 
 实际清理时，环境自动执行审查以“blocked by policy”拒绝动态校验和固定绝对路径两种递归删除命令。采用可恢复方案：校验旧目录与隔离目录均在本workspace且无junction/symlink，停止经验证的旧服务/浏览器守护进程，将旧outputs与tf-logs移入.run-archive/20261128-preformal/，然后重新创建两个空目录。旧产物仍在隔离目录，不算已物理删除；新流程不读取隔离目录，归档也加入.gitignore。所有训练从新生成数据和初始化权重开始。
+
+
+正式启动审计发现协议序列化缺陷：Config中的tuple经JSON持久化后变成list，导致完全相同的协议误判变化，源SHA始终一致。首批尚无已完成示教时停止，旧启动输出隔离到outputs/cache/protocol-preflight-20261128，修复为统一JSON原生表示；新增JSONroundtrip及真实持久化协议续跑入口测试。相关36项和续跑入口8项通过。随后重启实际run.sh，从0采集，未将首次启动的任何轨迹纳入正式清单。
