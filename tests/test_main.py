@@ -82,11 +82,13 @@ def test_main_fresh_cloud_encoder_preserves_only_requested_split_reference(tmp_p
     monkeypatch.setattr(train, 'train_policy', capture_training)
     main.main(['--mode', 'train', '--potential-field', '--no-closed-loop-selection',
                '--field-cloud-geometry-encoder', 'shared_pool_v1',
+               '--field-steering-loss-weight', '0.05',
                '--split-reference-checkpoint', str(reference)] + cli_args(tmp_path, monkeypatch))
     assert len(calls) == 1
     assert calls[0]['model_config']['cloud_geometry_encoder'] == 'shared_pool_v1'
     assert calls[0]['split_reference_checkpoint'] == reference
     assert calls[0]['initial_checkpoint'] is None
+    assert calls[0]['field_steering_loss_weight'] == .05
 
 
 def test_field_evaluation_requires_selected_model_instead_of_falling_back_to_best(tmp_path, monkeypatch):

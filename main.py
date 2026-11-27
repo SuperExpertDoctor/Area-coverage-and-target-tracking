@@ -83,6 +83,8 @@ def parser():
                    help='Bounded BC weight for expert corrections; 1 disables weighting')
     p.add_argument('--correction-threshold',type=float,default=.1,
                    help='Expert versus previous behavior command distance threshold')
+    p.add_argument('--field-steering-loss-weight',type=float,default=0.,
+                   help='Field-only execution-aware steering BCE added to BC Loss; raw Action MSE/MAE stay unchanged')
     p.add_argument('--dagger-recovery-min-steps',type=int,default=0,
                    help='Minimum training action exposures per accepted DAgger prefix; 0 disables repeats')
     p.add_argument('--checkpoint-path',type=Path,default=None)
@@ -334,6 +336,7 @@ def main(argv=None):
                     normalization_min_std=args.normalization_min_std,
                     correction_weight_max=args.correction_weight_max,
                     correction_threshold=args.correction_threshold,
+                    field_steering_loss_weight=args.field_steering_loss_weight,
                     dagger_recovery_min_steps=args.dagger_recovery_min_steps,
                     model_config=model_config,
                     initial_checkpoint=initial_checkpoint,

@@ -6,13 +6,15 @@ grad_clip=1., validation_fraction=.2, seed=0, hidden_size=128, device='cpu',
 num_threads=1, model_config=None, metadata=None, normalize_vectors=True,
 normalization_min_std=.1, initial_checkpoint=None,
 correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
-split_reference_checkpoint=None)``
+split_reference_checkpoint=None, field_steering_loss_weight=0.)``
 
 An episode begins with zero hidden state. Its contiguous TBPTT chunks carry
 ``hidden.detach()``. Episodes, never individual fragments, are shuffled. Loss is
 mean squared action distance per valid step; field-v2 includes normalized pan.
 Action_MSE and Action_MAE divide by the actual number of valid components.
-Neither is an accuracy or likelihood. Validation starts at the true episode start.
+Neither is an accuracy or likelihood. Optional field steering supervision adds
+an explicitly recorded execution-aware term to Loss, retaining the raw action
+metrics and labels. Validation starts at the true episode start.
 """
 
 import hashlib
@@ -30,6 +32,7 @@ from .datasets import (FIELD_ACTION_SCHEMA, FIELD_OBSERVATION_SCHEMA, SequenceDa
                        pad_episodes, read_episode_metadata, split_episodes)
 from .policy_coverage import CoveragePolicy
 from .policy_tracking import TrackingPolicy
+from .dynamics import GRAVITY
 
 
 def create_policy(task, config=None, **kwargs):
@@ -115,10 +118,53 @@ def _training_sample_order(dataset, minimum_steps=0):
                                                   expected_action_steps=total_steps, repeated_episodes=repeated)
 
 
+def _field_steering_loss(predicted, target, vector):
+    """Per-step excess BCE against true requested bank from raw field inputs.
+
+    omega*tau is a positive gradient-surrogate scale, not an exact bank model.
+    The teacher probability uses the exact saturated physical bank request.
+    Subtracting detached teacher BCE makes perfect raw imitation cost zero.
+    """
+    if vector.shape[-1] not in (111, 134):
+        raise ValueError("field steering loss requires obs-field-v2")
+    raw=vector.to(dtype=predicted.dtype)
+    start=98 if raw.shape[-1]==111 else 106
+    eps=1e-6
+    speed=(raw[...,start]*(220/3.6)).clamp_min(eps)
+    radius=(raw[...,start+1]*3000.).clamp_min(eps)
+    max_bank=(raw[...,start+2]*math.pi).clamp(eps,math.pi/2-eps)
+    tau=raw[...,start+5].clamp_min(eps)
+    limit=torch.minimum(max_bank,torch.atan(speed.square()/(GRAVITY*radius))).clamp_min(eps)
+    omega=GRAVITY*torch.tan(limit)/speed
+    scale=(omega*tau).clamp_min(eps)
+    heading=raw[...,2:4]
+    def sine(action):
+        cross=heading[...,0]*action[...,1]-heading[...,1]*action[...,0]
+        normalizer=(heading.norm(dim=-1)*action[...,:2].norm(dim=-1)).clamp_min(eps)
+        return cross/normalizer
+    with torch.no_grad():
+        cross=heading[...,0]*target[...,1]-heading[...,1]*target[...,0]
+        dot=(heading*target[...,:2]).sum(-1)
+        delta=torch.remainder(torch.atan2(cross,dot)+math.pi,2*math.pi)-math.pi
+        rate=(delta/tau).clamp(-omega,omega)
+        bank=torch.atan(speed*rate/GRAVITY)/limit
+        probability=((bank+1)/2).clamp(0,1)
+        baseline=torch.nn.functional.binary_cross_entropy_with_logits(
+            2*sine(target)/scale,probability,reduction='none')
+    loss=torch.nn.functional.binary_cross_entropy_with_logits(
+        2*sine(predicted)/scale,probability,reduction='none')
+    return torch.relu(loss-baseline)
+
+
 def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=None,
-               grad_clip=1., order=None, correction_weight_max=1., correction_threshold=.1):
+               grad_clip=1., order=None, correction_weight_max=1., correction_threshold=.1,
+               field_steering_loss_weight=0.):
     """Encode map chunks only, carrying causal state across contiguous chunks."""
     training = optimizer is not None
+    if not math.isfinite(field_steering_loss_weight) or field_steering_loss_weight<0:
+        raise ValueError("invalid field_steering_loss_weight")
+    if field_steering_loss_weight and not getattr(model,'model_config',{}).get('potential_field',False):
+        raise ValueError("field steering loss is supported only by field models")
     model.train(training)
     indices = list(range(len(dataset))) if order is None else order
     squared_sum = absolute_sum = 0.
@@ -143,6 +189,13 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                 error = predicted - batch["actions"]
                 square = (error.square() * mask).sum()
                 step_count = int(batch["mask"].sum().item())
+                per_step=error.square().sum(-1)
+                if field_steering_loss_weight:
+                    valid=batch['mask'].bool()
+                    auxiliary=torch.zeros_like(per_step)
+                    auxiliary[valid]=_field_steering_loss(
+                        predicted[valid],batch['actions'][valid],batch['vector'][valid])
+                    per_step=per_step+field_steering_loss_weight*auxiliary
                 if training and correction_weight_max > 1:
                     # This is the previous command in raw common observations,
                     # not current heading, executed velocity or normalized MLP input.
@@ -151,14 +204,15 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                     weights = torch.ones_like(batch["mask"], dtype=error.dtype)
                     weights = torch.where(correction, weights * correction_weight_max, weights)
                     weights = weights * batch["mask"]
-                    objective = (error.square().sum(-1) * weights).sum()
+                    objective = (per_step * weights).sum()
                     weight_count = weights.sum()
                     loss = objective / weight_count
                 else:
                     # Preserve the original graph and arithmetic when disabled;
                     # validation and initial epoch 0 always take this branch.
-                    objective, weight_count = square, step_count
-                    loss = square / step_count
+                    objective=(per_step*batch['mask']).sum() if field_steering_loss_weight else square
+                    weight_count=step_count
+                    loss = objective / step_count
                 if training:
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
@@ -265,7 +319,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                  device="cpu", num_threads=1, model_config=None, metadata=None,
                  normalize_vectors=True, normalization_min_std=.1, initial_checkpoint=None,
                  correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
-                 split_reference_checkpoint=None):
+                 split_reference_checkpoint=None, field_steering_loss_weight=0.):
     """Train one task, write six meaningful TensorBoard metrics and best/last files.
 
     ``model_config`` accepts ``vector_dim``, ``hidden_size`` and
@@ -308,6 +362,13 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     minimum training exposure budget. Each draw resets recurrent state; unique
     episodes determine normalization and splits. Epoch zero and validation do
     not resample. Training metrics describe the actual training draws.
+    field_steering_loss_weight adds field-only excess soft-target BCE using the
+    actual requested teacher bank from observed physical parameters. Its positive
+    omega_max*heading_tau scale is a gradient surrogate, not an exact bank model.
+    Correction weights multiply the combined action/steering objective; initial
+    and validation Loss use the same objective without correction weighting.
+    Raw three-component Action_MSE/MAE and original labels remain unchanged.
+    The default zero preserves the previous loss arithmetic exactly.
 
     Returns JSON-safe initial/best validation MSE, initial validation metrics,
     checkpoint paths, history (epoch/Train/Validation), split and train config.
@@ -324,6 +385,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                                         ("normalization_min_std", normalization_min_std, 0, False),
                                         ("correction_weight_max", correction_weight_max, 1, False),
                                         ("correction_threshold", correction_threshold, 0, False),
+                                        ("field_steering_loss_weight", field_steering_loss_weight, 0, False),
                                         ("grad_clip", grad_clip, 0, True)]:
         if not math.isfinite(value) or (value <= minimum if strict else value < minimum):
             raise ValueError(f"invalid {name}")
@@ -384,6 +446,8 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         options = dict(hidden_size=hidden_size)
         options.update(model_config or {})
     field_mode = bool(options.get("potential_field", False))
+    if field_steering_loss_weight and not field_mode:
+        raise ValueError("field steering loss is supported only by field models")
     observation_schema = FIELD_OBSERVATION_SCHEMA if field_mode else "obs-v1"
     action_schema = FIELD_ACTION_SCHEMA if field_mode else "action-v1"
     reference_split = None
@@ -453,6 +517,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     train_config["correction_weight_max"] = float(correction_weight_max)
     train_config["correction_threshold"] = float(correction_threshold)
     train_config["dagger_recovery_min_steps"] = int(dagger_recovery_min_steps)
+    train_config["field_steering_loss_weight"] = float(field_steering_loss_weight)
     train_config["training_sampling"] = sampling_report
     loss_definition = dict(
         training=("sum(valid * weight * squared_world_xy_and_normalized_pan_error) / sum(valid * weight)"
@@ -463,6 +528,14 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         epoch_zero="unweighted", validation="unweighted", action_mse_mae="unweighted",
         training_sampling="complete accepted DAgger prefix repeats; independent recurrent resets",
         evaluation_sampling="unique original episodes, no repeats")
+    if field_steering_loss_weight:
+        loss_definition['field_steering']=(
+            'relu(BCEWithLogits(2*sin(delta_pred)/(omega_max*heading_tau), '
+            '(true_requested_teacher_bank/bank_limit+1)/2) - detached teacher BCE baseline)')
+        loss_definition['training']='sum(valid * correction_weight * (squared_three_component_error + field_steering_loss_weight * field_steering)) / sum(valid * correction_weight)'
+        loss_definition['auxiliary_physics']='raw same-observation heading/speed/radius/max_bank/heading_tau; positive omega*tau gradient surrogate, not exact bank prediction; valid steps only'
+        loss_definition['epoch_zero']='unweighted combined BC + field steering objective'
+        loss_definition['validation']='unweighted combined BC + field steering objective'
     train_config["loss_definition"] = loss_definition
     train_config.update(observation_schema=observation_schema, action_schema=action_schema,
                         action_dim=train_dataset.action_dim)
@@ -501,9 +574,11 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     dataset_metadata = read_episode_metadata(train_dataset.paths[0])
     best_path, last_path = output_dir / "best.pt", output_dir / "last.pt"
     history = []
-    initial_validation = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device)
+    initial_validation = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device,
+                                    field_steering_loss_weight=field_steering_loss_weight)
                           if len(validation_dataset) else None)
-    initial_train = _run_epoch(model, train_dataset, batch_size, sequence_length, target_device)
+    initial_train = _run_epoch(model, train_dataset, batch_size, sequence_length, target_device,
+                               field_steering_loss_weight=field_steering_loss_weight)
     best_mse = (initial_validation or initial_train)["action_mse"]
     best_epoch = 0
 
@@ -546,12 +621,15 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
             train_metrics = _run_epoch(model, train_dataset, batch_size, sequence_length,
                                        target_device, optimizer=optimizer, grad_clip=grad_clip, order=order,
                                        correction_weight_max=correction_weight_max,
-                                       correction_threshold=correction_threshold)
-            validation_metrics = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device)
+                                       correction_threshold=correction_threshold,
+                                       field_steering_loss_weight=field_steering_loss_weight)
+            validation_metrics = (_run_epoch(model, validation_dataset, batch_size, sequence_length, target_device,
+                                            field_steering_loss_weight=field_steering_loss_weight)
                                   if len(validation_dataset) else None)
             selection_metrics = validation_metrics
             if selection_metrics is None:
-                selection_metrics = (_run_epoch(model, train_dataset, batch_size, sequence_length, target_device)
+                selection_metrics = (_run_epoch(model, train_dataset, batch_size, sequence_length, target_device,
+                                               field_steering_loss_weight=field_steering_loss_weight)
                                      if len(training_order) > len(train_dataset) else train_metrics)
             score = selection_metrics["action_mse"]
             if score < best_mse:

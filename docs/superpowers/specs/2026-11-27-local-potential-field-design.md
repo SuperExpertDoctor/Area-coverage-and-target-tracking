@@ -66,6 +66,16 @@ CNN 为 4→16→32→32 的三层卷积及 128 维投影，物理向量编码�
 
 `field_frame`、`pan_residual`、`pan_reference`、`direction_reference` 及参考半径/增益随 checkpoint 保存；旧 field 权重缺少新选项时按旧解释加载。可显式使用 heading/actual 参考做消融。环境不会替网络投影到理想轨道，跟踪 1300m 近距参考用于初始化/专家引导，运行中的实际最小距离和误差必须实测报告。
 
+### 可选执行感知监督
+
+32103的真实反例表明，比较世界XY动作的误差可能低估转弯分支错误：5463s网络与专家方向仅差24.55°，相对当前航向却分别在−160.89°和+174.56°附近，物理控制器要求相反的满倾斜。直接对裁剪后的bank做MSE又会在饱和区失去梯度。因此增加默认关闭的 `--field-steering-loss-weight λ`，只改变训练目标，不改变观测、专家原标签、网络架构、环境动力学或部署执行。
+
+所有参数从共同原始观测读取。令 `δ=wrap(command_heading−physical_heading)`，范围为[-π,π)，`b_lim=min(b_max,atan(V²/(g R_min)))`、`ω_max=g tan(b_lim)/V`、`α=ω_max τ_heading`。专家真实请求为 `b*=atan(V clip(δ*/τ_heading,−ω_max,+ω_max)/g)`，监督目标 `p=(b*/b_lim+1)/2`。梯度代理取 `z=2 sin(δ)/max(α,1e−6)`；使用正的α本身，避免未限制α时sinα翻号或奇异。它不是精确可微的bank预测模型。
+
+定义 `E=relu(BCEWithLogits(z_pred,p)−stop_gradient(BCEWithLogits(z_teacher,p)))`。每步目标为三维原动作平方误差和加 `λ E`；训练的纠正权重作用于整个组合目标。验证与第0轮使用同一组合目标但不加纠正权重。原始Action MSE/MAE仍按三个动作分量计算，不受辅助项改变；TensorBoard仍只有六项已有指标，不能把这个内部BCE冒充随机策略NLL。
+
+完美匹配专家时E为0；比专家更稳健但物理上近似等效的方向也可能E为0，因此仍须保留原动作BC。近±π的实际错转可以获得跨最近正确分支的梯度，但在精确±90°处仍可能存在驻点；λ的相对作用也依赖物理参数。这是可证伪的训练改进，不是安全证明。掩码在几何计算前选取有效时刻，不能依靠事后乘0消除padding导致的NaN。λ=0直接走原计算路径，旧权重及跟踪验收结果不能被该实验重新解释。
+
 新数据和 checkpoint 显式带 obs-field-v2、action-field-v2；旧缓存、checkpoint 不得以同维度猜测兼容。JSON 回放包含原始命令、真实执行速度、实际 pan 与局部场采样；输出到 outputs 的独立 field-v2 目录，TF 到 tf-logs。入口 run.sh 明确所有新增环境、专家、网络参数。
 
 确切版本字符串：dataset_version=`bc-dataset-field-v2`，observation_schema/obs_schema=`obs-field-v2`，action_schema=`action-field-v2`，checkpoint_version=`bc-field-v2`。动作维度为 3，Loss 为每步三个动作平方误差之和；Action MSE/MAE 为所有三个分量的逐分量均值，不能沿用除以 2 的旧指标分母。模型归一化只拟合训练集；field_context 已有物理尺度，CNN 输入固定范围。默认在模型内部屏蔽上一命令，保留共同原始观测；两个任务模型仍完全独立。

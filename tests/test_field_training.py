@@ -410,3 +410,110 @@ def test_fresh_cloud_architecture_pins_historical_validation_without_warm_weight
         train.train_policy('coverage',folder,tmp_path/'bad',tmp_path/'bad-tf',epochs=1,
             initial_checkpoint=old['best_checkpoint'],model_config={'potential_field':True,
                 'cloud_geometry_encoder':'shared_pool_v1'})
+
+
+def steering_vector(task='coverage', length=1):
+    vector=torch.zeros(length,111 if task=='coverage' else 134)
+    vector[:,2]=1
+    start=98 if task=='coverage' else 106
+    vector[:,start]=50/(220/3.6)
+    vector[:,start+1]=1800/3000
+    vector[:,start+2]=.25/np.pi
+    vector[:,start+5]=2.
+    return vector
+
+
+@pytest.mark.parametrize('predicted,target,direction',[(-179.,179.,1),(179.,-179.,-1),(-140.,80.,1)])
+def test_execution_loss_has_correct_nonzero_wrap_and_confident_wrong_branch_gradients(predicted,target,direction):
+    angle=torch.tensor(np.radians(predicted),requires_grad=True)
+    action=torch.stack([angle.cos(),angle.sin(),angle*0]).reshape(1,1,3)
+    teacher=torch.tensor([np.cos(np.radians(target)),np.sin(np.radians(target)),0.]).reshape(1,1,3)
+    loss=train._field_steering_loss(action,teacher,steering_vector().unsqueeze(0))
+    loss.sum().backward()
+    assert angle.grad*direction>1.
+    assert torch.isfinite(loss).all()
+
+
+@pytest.mark.parametrize('task',['coverage','tracking'])
+def test_execution_loss_uses_observed_nondefault_physics_and_true_saturated_target(task):
+    import math
+    from src.dynamics import GRAVITY
+    angle=.04;target=.02
+    pred=torch.tensor([np.cos(angle),np.sin(angle),.9]).reshape(1,1,3)
+    label=torch.tensor([np.cos(target),np.sin(target),-.9]).reshape(1,1,3)
+    vector=steering_vector(task).unsqueeze(0)
+    limit=min(.25,math.atan(50**2/(GRAVITY*1800)))
+    omega=GRAVITY*math.tan(limit)/50
+    bank=math.atan(50*(target/2)/GRAVITY)/limit
+    expected=torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor(2*np.sin(angle)/(omega*2)),torch.tensor((bank+1)/2,dtype=pred.dtype))
+    baseline=torch.nn.functional.binary_cross_entropy_with_logits(
+        torch.tensor(2*np.sin(target)/(omega*2)),torch.tensor((bank+1)/2,dtype=pred.dtype))
+    expected=torch.relu(expected-baseline)
+    torch.testing.assert_close(train._field_steering_loss(pred,label,vector).squeeze(),expected,atol=1e-6,rtol=1e-5)
+    vector[..., (98 if task=='coverage' else 106)+5]=1.
+    assert not torch.allclose(train._field_steering_loss(pred,label,vector).squeeze(),expected)
+    perfect=train._field_steering_loss(label,label,vector)
+    torch.testing.assert_close(perfect,torch.zeros_like(perfect),atol=0,rtol=0)
+    vector[..., (98 if task=='coverage' else 106)+5]=100.
+    assert torch.isfinite(train._field_steering_loss(pred,label,vector)).all()
+
+
+def test_execution_loss_padding_zero_compatibility_raw_metrics_and_weighted_composite():
+    class Constant(torch.nn.Module):
+        model_config={'potential_field':True}
+        def __init__(self):
+            super().__init__();self.angle=torch.nn.Parameter(torch.tensor(np.radians(-179.),dtype=torch.float32))
+        def forward(self,obs,hidden=None):
+            shape=obs['vector'].shape[:2]
+            action=torch.stack([self.angle.cos(),self.angle.sin(),self.angle*0+.4])
+            return action.expand(*shape,3),torch.zeros(1,shape[0],1)
+    vector=steering_vector(length=2)
+    targets=torch.tensor([[np.cos(np.radians(179.)),np.sin(np.radians(179.)),.3],
+                          [np.cos(np.radians(-179.)),np.sin(np.radians(-179.)),.3]],dtype=torch.float32)
+    vector[0,8:10]=targets[0,:2]
+    item=dict(vector=vector,potential=torch.zeros(2,4,33,33),field_context=torch.zeros(2,16),actions=targets)
+    short={key:value[:1] for key,value in item.items()}
+    model=Constant();device=torch.device('cpu')
+    original=train._run_epoch(model,[item,short],2,2,device)
+    disabled=train._run_epoch(model,[item,short],2,2,device,field_steering_loss_weight=0.)
+    assert disabled==original
+    enabled=train._run_epoch(model,[item,short],2,2,device,field_steering_loss_weight=.05)
+    assert enabled['action_mse']==original['action_mse'] and enabled['action_mae']==original['action_mae']
+    assert enabled['loss']>original['loss']
+    prediction=model({'vector':vector.unsqueeze(0)})[0]
+    aux=train._field_steering_loss(prediction,targets.unsqueeze(0),vector.unsqueeze(0))[0]
+    per_step=(prediction[0]-targets).square().sum(-1)+.05*aux
+    result=train._run_epoch(model,[item],1,2,device,optimizer=torch.optim.SGD(model.parameters(),lr=0.),
+        correction_weight_max=4.,field_steering_loss_weight=.05)
+    assert result['loss']==pytest.approx(float((per_step*torch.tensor([1.,4.])).sum()/5))
+    zero=torch.zeros(1,2,111);pred=torch.zeros(1,2,3,requires_grad=True)
+    loss=train._field_steering_loss(pred,torch.zeros_like(pred),zero).sum();loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(pred.grad).all()
+
+
+def test_execution_loss_exact_positive_pi_uses_executor_right_turn_branch():
+    angle=torch.tensor(np.radians(179.),requires_grad=True)
+    predicted=torch.stack([angle.cos(),angle.sin(),angle*0]).reshape(1,1,3)
+    target=torch.tensor([-1.,0.,0.]).reshape(1,1,3)
+    train._field_steering_loss(predicted,target,steering_vector().unsqueeze(0)).sum().backward()
+    assert angle.grad<0  # gradient descent increases angle across +pi into right-turn branch
+
+
+def test_execution_loss_configuration_rejects_invalid_and_legacy_and_saves_definition(tmp_path):
+    for value in [-.1,float('nan'),float('inf')]:
+        with pytest.raises(ValueError,match='field_steering_loss_weight'):
+            train.train_policy('coverage',tmp_path,tmp_path/'bad',tmp_path/'tf-bad',epochs=1,field_steering_loss_weight=value)
+    with pytest.raises(ValueError,match='field'):
+        train.train_policy('coverage',tmp_path,tmp_path/'legacy',tmp_path/'tf-legacy',epochs=1,field_steering_loss_weight=.05)
+    folder=tmp_path/'field';folder.mkdir()
+    for index in range(3):
+        path=folder/f'{index}.npz';episode(path,scene=f'steering-{index}',length=3)
+        with np.load(path,allow_pickle=False) as source:arrays=dict(source)
+        arrays['vector']=steering_vector(length=4).numpy();np.savez_compressed(path,**arrays)
+    result=train.train_policy('coverage',folder,tmp_path/'model',tmp_path/'tf',epochs=1,batch_size=2,
+        sequence_length=2,model_config={'potential_field':True,'hidden_size':16},field_steering_loss_weight=.05)
+    state=torch.load(result['last_checkpoint'],weights_only=False)
+    assert state['train_config']['field_steering_loss_weight']==.05
+    assert 'BCEWithLogits' in state['loss_definition']['field_steering']
+    assert result['train_config']['field_steering_loss_weight']==.05
