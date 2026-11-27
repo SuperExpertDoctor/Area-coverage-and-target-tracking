@@ -41,9 +41,12 @@ class SceneSpec:
     radar_pan_initial: float
     episode_seconds: float
     config_snapshot: dict
+    sampling_rejections: dict | None = None
 
     def to_dict(self):
-        return json.loads(json.dumps(asdict(self)))
+        result=json.loads(json.dumps(asdict(self)))
+        if result['sampling_rejections'] is None:result.pop('sampling_rejections')
+        return result
 
     @classmethod
     def from_dict(cls, scene):
@@ -53,6 +56,48 @@ class SceneSpec:
 def scene_hash(scene):
     if hasattr(scene,'to_dict'):scene=scene.to_dict()
     return hashlib.sha256(json.dumps(scene,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def initial_flight_viability_certificate(uav,clouds,config):
+    """Certify some impossible starts, without treating planner failure as proof.
+
+    For |yaw_rate|<=w and t<=pi/(2w), all possible control histories lie in
+    forward [V*sin(wt)/w,V*t], lateral +/-V*(1-cos(wt))/w. Finite roll only
+    shrinks this enclosing box. Reject only if an entire box lies inside a hard
+    cloud or outside one world half-plane. Passing is not a viability guarantee.
+    """
+    speed=config.uav_speed;rate=config.uav_config.max_yaw_rate
+    horizon=math.pi/(2*rate)
+    count=max(1,int(math.ceil(horizon/config.physics_dt)))
+    times=np.minimum(np.arange(1,count+1)*config.physics_dt,horizon)
+    low=speed*np.sin(rate*times)/rate;high=speed*times
+    lateral=speed*(1-np.cos(rate*times))/rate
+    cosine,sine=math.cos(uav.heading),math.sin(uav.heading)
+    certificates=[]
+    for ob in clouds:
+        dx,dy=ob['x']-uav.x,ob['y']-uav.y
+        radius=ob['radius']+config.uav_cloud_margin
+        if math.hypot(dx,dy)>radius+speed*horizon:continue
+        forward=dx*cosine+dy*sine;side=-dx*sine+dy*cosine
+        far2=np.maximum((low-forward)**2,(high-forward)**2)+(abs(side)+lateral)**2
+        hits=np.flatnonzero(far2<radius**2-1e-6)
+        if len(hits):
+            index=int(hits[0])
+            certificates.append(dict(kind='cloud',obstacle_id=ob.get('id'),time_seconds=float(times[index]),
+                                     farthest_distance=float(math.sqrt(far2[index])),hard_radius=radius))
+    body_x=np.stack((low,low,high,high),axis=1)
+    body_y=np.stack((-lateral,lateral,-lateral,lateral),axis=1)
+    world_x=uav.x+cosine*body_x-sine*body_y;world_y=uav.y+sine*body_x+cosine*body_y
+    b=config.world_bounds
+    for name,mask in [('left',world_x.max(1)<b[0]-1e-6),('right',world_x.min(1)>b[2]+1e-6),
+                      ('bottom',world_y.max(1)<b[1]-1e-6),('top',world_y.min(1)>b[3]+1e-6)]:
+        hits=np.flatnonzero(mask)
+        if len(hits):certificates.append(dict(kind='world_boundary',edge=name,time_seconds=float(times[int(hits[0])])))
+    return min(certificates,key=lambda item:item['time_seconds']) if certificates else None
+
+
+def initial_flight_is_provably_unviable(uav,clouds,config):
+    return initial_flight_viability_certificate(uav,clouds,config) is not None
 
 
 def validate_scene(scene,config,task=None):
@@ -78,6 +123,9 @@ def validate_scene(scene,config,task=None):
         for state,obstacles,margin in [(u,scene['clouds'],config.uav_cloud_margin),(s,scene['islands'],config.ship_island_margin)]:
             if any(math.hypot(state.x-o['x'],state.y-o['y'])<=o['radius']+margin for o in obstacles):
                 raise SceneValidationError('Initial obstacle collision')
+        certificate=initial_flight_viability_certificate(u,scene['clouds'],config)
+        if certificate is not None:
+            raise SceneValidationError(f"Unavoidable initial flight collision: {json.dumps(certificate,sort_keys=True)}")
         route=np.asarray(scene['ship_route'],dtype=float)
         if route.ndim!=2 or route.shape[1]!=2 or len(route)<2 or not np.isfinite(route).all():
             raise SceneValidationError('Invalid ship route')
@@ -180,6 +228,7 @@ def _sample(config,rng,task,seed):
             else:pan=0.
             scene=SceneSpec('scene-v1',task,int(seed),tuple(config.world_bounds),tuple(roi) if roi else None,tuple(clouds),tuple(islands),asdict(uav),asdict(ship),tuple(map(tuple,route)),float(pan),config.coverage_episode_seconds if task=='coverage' else config.tracking_episode_seconds,config.to_dict()).to_dict()
             validate_scene(scene,config,task)
+            if rejected:scene['sampling_rejections']=dict(rejected)
             return scene
         except (ValueError,OverflowError) as error:
             key=str(error);rejected[key]=rejected.get(key,0)+1

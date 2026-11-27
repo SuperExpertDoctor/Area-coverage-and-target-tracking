@@ -27,17 +27,21 @@ def test_boundary_starts_are_uniform_in_perimeter_distance_and_clockwise():
         assert right @ center > 0
 
 
-def test_algorithm_failure_is_saved_in_full_and_never_excluded(tmp_path):
+def test_algorithm_failure_is_saved_in_full_and_never_excluded(tmp_path,monkeypatch):
     from config import Config
     from env_coverage import CoverageEnv
     from expert_validation import execute_case
+    from expert_coverage import CoverageExpert
+    from expert_tracking import ExpertPlanningError
     config = Config(coverage_episode_seconds=2)
     env = CoverageEnv(config)
     env.reset(seed=4)
     scene = copy.deepcopy(env.scene)
-    scene['uav_initial']['heading'] = 0.
-    initial = scene['uav_initial']
-    scene['clouds'] = [{'id':0, 'x':initial['x']+450., 'y':initial['y'], 'radius':200.}]
+    # Test failure recording on a valid scene. The old 50m-clearance fixture
+    # now correctly fails the independent unavoidable-collision certificate.
+    def fail_to_plan(self,obs):
+        raise ExpertPlanningError('Injected planner failure on a valid initial state')
+    monkeypatch.setattr(CoverageExpert,'act',fail_to_plan)
     job = {'case_id':'coverage-random-test', 'task':'coverage', 'kind':'random', 'seed':4, 'scene':scene}
     result = execute_case(job, config.to_dict(), str(tmp_path), 1., 1.)
     assert result['status'] == 'expert_planning_failure'

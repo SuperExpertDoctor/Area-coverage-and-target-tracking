@@ -26,6 +26,7 @@ Produces opt-in `Config.potential_enabled`, `potential_radius`, `potential_perio
 - [x] Test P(0)=-1, P(T)=1, exponential monotonic recovery, cloud -2 override outside ROI, timestamp re-entry.
 - [x] Test action[3] and finite pan, unit speed, legacy obs unchanged, local cache bounded by 33².
 - [x] Implement field query and env integration; run new tests plus dynamics/environment regressions.
+- [x] Reject certified unavoidable initial flight collisions, retain deterministic rejection metadata and the original failure evidence; verify near-cloud heading-away controls remain accepted.
 
 ### Task 2: Field experts
 
