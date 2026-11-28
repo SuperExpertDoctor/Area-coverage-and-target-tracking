@@ -33,6 +33,8 @@ bash run.sh
 bash run.sh formal --no-open-browser --no-keep-server
 # 单任务；同一协议中断后直接重复命令可续采集、从最近完整epoch恢复
 bash run.sh formal --task tracking --no-open-browser
+# 下一次运行使用独立实验目录（也可设置环境变量 EXPERIMENT_NAME）
+bash run.sh formal --experiment-name comparison-01 --no-open-browser --no-keep-server
 # 保留的分阶段接口
 bash run.sh collect --task coverage
 bash run.sh train --task tracking
@@ -43,6 +45,8 @@ python -m tensorboard.main --logdir tf-logs --host 127.0.0.1 --port 6006
 ```
 
 默认界面http://127.0.0.1:8787，TensorBoard http://127.0.0.1:6006。默认输出`outputs/formal`，指标`tf-logs/formal/{coverage,tracking}/formal-1000`。正式默认：覆盖10800秒、跟踪1800秒；采集8进程、展示帧间隔60步；20epochs、batch16、TBPTT长度128、学习率0.0003、验证比例0.2、GRU128、训练线程4、批内加载线程4。预检种子7100/7101；独立测试覆盖960000–960007、跟踪970000–970007。
+
+`--experiment-name comparison-01`将本次产物与缓存保存到`outputs/comparison-01/`，TensorBoard保存到`tf-logs/comparison-01/{coverage,tracking}/formal-1000/`；名称必须是单个合法目录名，支持中文，禁止路径分隔符、`.`、`..`及Windows保留名称。`--output-dir`与`--tf-log-dir`指定各自的父目录，`--run-name`仍控制任务内的TensorBoard运行子目录。`run.sh`默认传入实验名`formal`；直接调用`main.py`时省略实验名会保留原有路径规则。该参数仅影响下一次启动，不迁移已有产物，也不改变正在运行的任务。
 
 `--episodes`是**每任务成功回合数**。每回合完整观测、专家标签和实际动作均保留；稀疏展示帧不降低物理积分或训练采样频率。无法初始化、规划失败、物理失败和任务未完成分别保留，只有成功清单中的NPZ进入训练。正式流程不使用旧数据或warm start；同源代码/配置/预算/种子协议可续跑，协议不一致必须使用新输出目录。
 
@@ -188,12 +192,14 @@ env.close()
 | `/events` |SSE场景、真实帧、进度和正式运行状态 |
 | `/api/replays` |JSON历史目录（大文件后台索引） |
 | `/api/visual-config` |入口显示配置 |
-| `/api/recording-config` |尺寸、FPS、码率、时长、上传限额 |
+| `/api/recording-config` |尺寸、FPS、码率、时长、上传限额、当前保存目录 |
 | `/api/run-status` |当前采集数量、训练阶段/epoch/损失 |
 | `POST /api/recordings` |有界原始视频上传，真实转码为H.264 MP4并保存来源元数据 |
 | `/outputs/...` |当前输出根目录内的回放/影片下载 |
 
-在界面选择历史后点击“开始录制”，可保存完整回放；点击“停止并保存”可提前停止，影片真实记录停止时刻。浏览器支持时直接录MP4，否则先捕获WebM再由FFmpeg转码，不改扩展名冒充MP4。自动录像含任务、模型SHA、控制模式、仿真时间和真实任务结果；转换失败会在UI显示错误。默认30秒、1440×900、24FPS，回放倍速只影响显示时间，不改变仿真速度。全域螺线路程约2000km，12节完成约80–90小时；30分钟跟踪演示展示其中一段。
+前端操作集中在顶部的数据、视图、回放与录制菜单。所有可视化开关位于“视图”，包括经过网格、雷达覆盖年龄、引斥场色块、相邻栅格差分方向箭头和轨迹；支持局部引斥场近景。默认白色主题，可切换深海蓝并记住选择，两套主题均区分无人机、船舶、云区、岛屿及各图层。图中的大虚线圈表示局部引斥场采样范围（默认半径6km），雷达视场则使用单独的物理距离（默认3km）。
+
+在顶部“录制”菜单打开“录制演示”开关，可保存完整历史回放或当前实时场景；关闭开关可提前停止，影片真实记录停止时刻。到时自动保存到当前实验的`outputs/<experiment-name>/recordings/`，界面显示保存路径与下载链接。浏览器支持时直接录MP4，否则先捕获WebM再由FFmpeg转码，不改扩展名冒充MP4。自动录像含任务、模型SHA、控制模式、仿真时间和真实任务结果；转换失败会在UI显示错误。默认30秒、1440×900、24FPS，回放倍速只影响显示时间，不改变仿真速度。全域螺线路程约2000km，12节完成约80–90小时；30分钟跟踪演示展示其中一段。
 
 ## 项目结构与产物
 

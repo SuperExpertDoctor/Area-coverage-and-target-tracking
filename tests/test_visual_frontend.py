@@ -167,6 +167,7 @@ def run_app_js(script):
       import assert from 'node:assert/strict';
       import fs from 'node:fs';
       import vm from 'node:vm';
+      import {fieldGeometry} from './visual/field.js';
       class Element {
         constructor(){this.textContent='';this.value='';this.children=[];this.style={};this.classList={toggle(){}};this.listeners={};}
         get parentElement(){return this;}
@@ -182,7 +183,7 @@ def run_app_js(script):
         constructor(){this.config={visual_trail_seconds:60,visual_grid_cell_size:250,visual_grid_fade_seconds:600};}
         setScene(){} setView(){}
       }
-      const context=vm.createContext({document,MaritimeMap,Map,Number,Math,performance:{now:()=>0},window:{addEventListener(){}},ResizeObserver:class{observe(){}},setInterval(){},fetch:async()=>({ok:true,json:async()=>({replays:[]})}),formatTime:()=> '01:00'});
+      const context=vm.createContext({document,MaritimeMap,fieldGeometry,Map,Number,Math,performance:{now:()=>0},window:{addEventListener(){}},ResizeObserver:class{observe(){}},setInterval(){},fetch:async()=>({ok:true,json:async()=>({replays:[]})}),formatTime:()=> '01:00'});
       const source=fs.readFileSync('visual/app.js','utf8').replace(/^import .*$/gm,'').replace('updateChoices();activateReplay(null);loadVisualConfig();refreshCatalog(true);connectLive();requestAnimationFrame(tick);','');
       vm.runInContext(source,context);
       const execute=code=>vm.runInContext(code,context);
@@ -209,6 +210,27 @@ def test_constrained_policy_is_identified_in_history_and_live_status_and_catalog
       assert.equal(elements.get('replay-select').children[0].textContent,'pure.json · 01:00 · 2 帧');
       assert.equal(elements.get('replay-select').children[1].textContent,'dagger.json [DAgger训练混合] · 01:00 · 2 帧');
       assert.equal(execute('state.actor'),'policy');
+    """)
+
+
+def test_field_controls_distinguish_missing_data_and_independent_layers():
+    run_app_js("""
+      execute('map.showPotential=true;map.showFieldVectors=true;updateFieldControls({t:0})');
+      assert.equal(elements.get('potential-key').hidden,true);
+      assert.equal(elements.get('field-notice').hidden,false);
+      execute('map.showPotential=false;map.showFieldVectors=false;updateFieldControls({t:0})');
+      assert.equal(elements.get('field-notice').hidden,true);
+      execute('map.showFieldVectors=true;updateFieldControls({potential:{bounds:[0,0,12000,12000],values:[[0,1],[0,1]],range:[-2,1]}})');
+      assert.equal(elements.get('potential-key').hidden,false);
+      assert.equal(elements.get('potential-scale').hidden,true);
+      assert.equal(elements.get('field-vector-key').hidden,false);
+      assert(elements.get('field-resolution').textContent.includes('6.0 km'));
+      execute('map.showPotential=true;map.showFieldVectors=false;updateFieldControls({potential:{bounds:[0,0,2,2],values:[[0,1],[0,1]]}})');
+      assert.equal(elements.get('potential-scale').hidden,false);
+      assert.equal(elements.get('field-vector-key').hidden,true);
+      execute('updateFieldControls(null)');
+      assert.equal(elements.get('potential-key').hidden,true);
+      assert.equal(elements.get('field-notice').hidden,true);
     """)
 
 

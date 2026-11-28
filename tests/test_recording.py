@@ -38,7 +38,11 @@ def test_recording_configuration_and_bounds(service):
         config = json.load(response)
     assert config['recording_width'] == 320
     assert config['recording_max_bytes'] == 1000000
-    assert upload(service, b'x' * 1000001)[0] == 413
+    assert Path(config['output_directory']) == service.output_dir / 'recordings'
+    assert not (service.output_dir / 'recordings').exists()
+    # The limit is checked before reading the body. Sending a large body while
+    # the server closes early races Windows' unread-data connection reset.
+    assert upload(service, b'', **{'Content-Length': '1000001'})[0] == 413
     assert upload(service, b'x', mime='text/plain')[0] == 415
     assert upload(service, b'x', Origin='https://unrelated.invalid')[0] == 403
     assert upload(service, b'x', metadata={'duration_seconds': 9})[0] == 400

@@ -1,11 +1,12 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0a1520">
+  <meta name="theme-color" content="#f2f5f9">
   <title>海空联合调度 · 仿真控制台</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='8' fill='%230a141e'/%3E%3Cpath d='m9 25 11-17 11 17-11-5Z' fill='none' stroke='%2370ddd6' stroke-width='2'/%3E%3C/svg%3E">
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('maritime-theme')==='dark'?'dark':'light'}catch(_){}</script>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -19,43 +20,82 @@
         <button class="task-tab active" data-task="coverage" aria-pressed="true">区域覆盖<span>01</span></button>
         <button class="task-tab" data-task="tracking" aria-pressed="false">协同跟踪<span>02</span></button>
       </nav>
-      <div class="connection"><i id="connection-dot"></i><span id="connection-text">连接实时服务</span></div>
+      <div class="header-tools">
+        <nav class="menu-bar" aria-label="顶部菜单栏">
+          <details class="menu" id="data-menu">
+            <summary>数据<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></summary>
+            <div class="menu-popover source-bar" aria-label="数据源与策略">
+              <h2>数据与策略</h2>
+              <div class="segmented source-switch"><button id="history-mode" class="active" aria-pressed="true">历史回放</button><button id="live-mode" aria-pressed="false">实时仿真</button></div>
+              <label class="control-label" for="actor">控制策略</label>
+              <select id="actor" class="compact-select"><option value="expert">专家策略</option><option value="policy">行为克隆网络</option></select>
+              <label class="control-label" for="replay-select">回放记录</label>
+              <select id="replay-select" class="replay-select"><option value="">正在读取回放记录…</option></select>
+              <div class="menu-actions"><button id="refresh" class="text-button"><svg viewBox="0 0 20 20"><path d="M16 6V2m0 4h-4M16 6a7 7 0 1 0 1 7"/></svg>刷新列表</button><label class="upload-button" for="replay-file"><svg viewBox="0 0 20 20"><path d="M10 13V3m-4 4 4-4 4 4M3 13v4h14v-4"/></svg>导入 JSON</label></div>
+              <input id="replay-file" type="file" accept=".json,application/json" hidden>
+            </div>
+          </details>
+          <details class="menu" id="view-menu">
+            <summary>视图<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></summary>
+            <div class="menu-popover view-menu">
+              <h2>视角与显示</h2>
+              <div class="view-switch segmented" aria-label="视角选择"><button data-view="mission" class="active" aria-pressed="true">任务区</button><button data-view="overview" aria-pressed="false">全域</button><button data-view="field" aria-pressed="false" title="跟随无人机，放大局部引斥场">引斥场</button><button data-view="uav" aria-pressed="false">无人机</button><button data-view="ship" aria-pressed="false">船舶</button></div>
+              <div class="layer-toolbar" aria-label="图层与轨迹显示">
+                <label title="UAV经过位置按仿真时间渐淡，区别于雷达覆盖"><span>经过网格<small>通行痕迹与网格线</small></span><input id="show-grid" type="checkbox" aria-label="经过网格" checked></label>
+                <label title="独立的雷达扫描信息年龄图层"><span>雷达覆盖年龄<small>观测的新旧程度</small></span><input id="show-age" type="checkbox" aria-label="雷达覆盖年龄" checked></label>
+                <label class="field-control" title="云 -2，已扫及区外 -1，待扫 +1"><span>引斥场色块<small>颜色深浅表示场值大小</small></span><input id="show-potential" type="checkbox" aria-label="引斥场色块" checked></label>
+                <label class="field-control" title="由相邻栅格差分计算，沿正梯度指向高场值"><span>场方向<small>显示栅格间的方向箭头</small></span><input id="show-field-vectors" type="checkbox" aria-label="场方向" checked></label>
+                <label><span>轨迹<small>平台的历史运动轨迹</small></span><input id="show-trail" type="checkbox" aria-label="轨迹" checked></label>
+                <label class="control-label" for="trail-style">轨迹样式</label><select id="trail-style"><option value="meteor">流星尾迹 · 60s</option><option value="history">完整历史</option></select>
+              </div>
+              <div class="theme-controls"><span class="control-label">背景主题</span><div class="segmented" aria-label="背景主题"><button data-theme-choice="light" aria-pressed="true" class="active">白色</button><button data-theme-choice="dark" aria-pressed="false">深海蓝</button></div></div>
+              <div class="menu-actions zoom-controls"><button id="zoom-in" class="text-button" aria-label="放大海图">放大</button><button id="zoom-out" class="text-button" aria-label="缩小海图">缩小</button><button id="reset-view" class="text-button" aria-label="重置视角">重置视角</button></div>
+            </div>
+          </details>
+          <details class="menu" id="playback-menu">
+            <summary>回放<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></summary>
+            <div class="menu-popover playback" aria-label="回放控制">
+              <h2>回放控制</h2>
+              <div class="transport-controls"><button id="play" class="play-button" aria-label="播放回放" disabled><svg id="play-icon" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7Z"/></svg></button><button id="restart" class="icon-button" aria-label="从头回放" title="从头回放"><svg viewBox="0 0 20 20"><path d="M4 4v12M15 4 6 10l9 6Z"/></svg></button><div class="time-display"><strong id="current-time">00:00</strong><span>/ <span id="total-time">00:00</span></span></div></div>
+              <div class="timeline"><label class="control-label" for="seek">回放时间</label><input id="seek" type="range" min="0" max="0" value="0" step="1" disabled><div class="timeline-ticks"><span>起点</span><span id="timeline-middle">—</span><span id="timeline-end">终点</span></div></div>
+              <div class="playback-options"><label class="control-label" for="speed">回放速度</label><select id="speed" class="speed-select"><option value="1">1×</option><option value="5">5×</option><option value="20">20×</option><option value="60" selected>60×</option><option value="120">120×</option></select><div class="frame-count" id="frame-count">0 帧</div></div>
+            </div>
+          </details>
+          <details class="menu" id="recording-menu">
+            <summary><span id="recording-menu-label">录制</span><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg></summary>
+            <div class="menu-popover recording-bar" aria-label="任务画面录制">
+              <h2>演示录制</h2>
+              <label class="recording-switch"><span>录制演示<small>到时自动保存，关闭开关提前保存</small></span><input id="record-toggle" type="checkbox" aria-label="录制演示" disabled></label>
+              <p class="menu-help">历史回放会从起点录制完整演示；实时仿真录制当前画面。</p>
+              <p id="recording-settings" class="recording-settings">读取录制设置…</p>
+              <output id="recording-status" role="status" aria-live="polite">准备录制</output>
+              <div class="recording-destination"><span class="control-label">自动保存位置</span><span id="recording-destination">当前实验 outputs / recordings</span></div>
+              <a id="recording-download" hidden download>下载已保存的 MP4 ↗</a>
+            </div>
+          </details>
+        </nav>
+        <div class="connection"><i id="connection-dot"></i><span id="connection-text">连接实时服务</span><span id="recording-indicator" hidden>REC</span></div>
+      </div>
     </header>
-
-    <section class="source-bar" aria-label="数据源与策略">
-      <div class="segmented source-switch"><button id="history-mode" class="active" aria-pressed="true">历史回放</button><button id="live-mode" aria-pressed="false">实时仿真</button></div>
-      <span class="bar-divider"></span>
-      <label class="control-label" for="actor">控制策略</label>
-      <select id="actor" class="compact-select"><option value="expert">专家策略</option><option value="policy">行为克隆网络</option></select>
-      <label class="sr-only" for="replay-select">选择回放记录</label>
-      <select id="replay-select" class="replay-select"><option value="">正在读取回放记录…</option></select>
-      <button id="refresh" class="icon-button" title="刷新回放列表" aria-label="刷新回放列表"><svg viewBox="0 0 20 20"><path d="M16 6V2m0 4h-4M16 6a7 7 0 1 0 1 7"/></svg></button>
-      <label class="upload-button" for="replay-file"><svg viewBox="0 0 20 20"><path d="M10 13V3m-4 4 4-4 4 4M3 13v4h14v-4"/></svg>导入 JSON</label>
-      <input id="replay-file" type="file" accept=".json,application/json" hidden>
-    </section>
 
     <main class="workspace">
       <section class="map-panel" aria-label="任务态势图">
-        <div class="map-topbar"><div><h2>任务态势</h2><span id="map-extent">300 × 300 km 海域</span></div><div class="view-switch segmented" aria-label="视角选择"><button data-view="mission" class="active" aria-pressed="true">任务区</button><button data-view="overview" aria-pressed="false">全域</button><button data-view="uav" aria-pressed="false">跟随无人机</button><button data-view="ship" aria-pressed="false">跟随船舶</button></div></div>
-        <div class="layer-toolbar" aria-label="图层与轨迹显示">
-          <label title="按UAV实际经过位置记录，离开后按仿真时间渐淡，不表示雷达覆盖"><input id="show-grid" type="checkbox" checked>经过网格</label>
-          <label title="独立的雷达扫描信息年龄图层"><input id="show-age" type="checkbox" checked>雷达覆盖年龄</label>
-          <label title="局部场：云 -2，已扫及区外 -1，待扫 +1；随信息价值失效周期 T 指数恢复"><input id="show-potential" type="checkbox" checked>局部引斥场</label>
-          <span class="layer-separator"></span>
-          <label><input id="show-trail" type="checkbox" checked>轨迹</label>
-          <label class="sr-only" for="trail-style">轨迹样式</label><select id="trail-style"><option value="meteor">流星尾迹 · 60s</option><option value="history">完整历史</option></select>
-          <output id="grid-summary" class="grid-summary">250 m · 600s 渐淡</output>
+        <div class="map-topbar"><div><h2>任务态势</h2><span id="map-extent">300 × 300 km 海域</span></div><output id="grid-summary" class="grid-summary">250 m · 600s 渐淡</output></div>
+        <div id="potential-key" class="potential-key" aria-label="引斥场图例" hidden>
+          <div class="field-legend-title">局部引斥场<span id="field-resolution">33 × 33</span></div>
+          <div id="potential-scale" class="potential-scale"><i class="field-color-scale"></i><div class="field-scale-labels"><span>−2 雷云</span><span>−1 斥力</span><span>0</span><span>+1 引力</span></div></div>
+          <span id="field-color-key" class="field-explanation">绝对值越大，颜色越深</span>
+          <span id="field-vector-key" class="field-vector-key"><svg viewBox="0 0 28 16" aria-hidden="true"><path d="M2 8h23m-6-5 6 5-6 5"/></svg><span>指向高场值<small>平坦区无箭头</small></span></span>
         </div>
+        <div id="field-notice" class="field-notice" role="status" hidden>当前帧未记录引斥场数据</div>
         <div class="map-container" id="map-container">
-          <canvas id="map" aria-label="海域、云区、岛屿、无人机航迹、船舶航迹及雷达视场"></canvas>
+          <canvas id="map" aria-label="海域、云区、岛屿、无人机航迹、船舶航迹、雷达视场及引斥场方向"></canvas>
           <div class="map-coordinate" id="coordinate">局部笛卡尔坐标 · km</div>
           <div class="north-indicator" aria-hidden="true"><span>N / +Y</span><svg viewBox="0 0 20 30"><path d="M10 2 3 22l7-5 7 5Z"/></svg></div>
-          <div class="zoom-controls"><button id="zoom-in" aria-label="放大海图">+</button><button id="zoom-out" aria-label="缩小海图">−</button><button id="reset-view" title="重置视角" aria-label="重置视角"><svg viewBox="0 0 20 20"><path d="M7 3H3v4m10-4h4v4M3 13v4h4m6 0h4v-4M7 10h6m-3-3v6"/></svg></button></div>
           <div class="empty-state" id="empty-state"><svg viewBox="0 0 52 52"><circle cx="26" cy="26" r="20"/><path d="M26 6v20l14 14M6 26h40M26 46V26"/></svg><h3>等待仿真数据</h3><p id="empty-message">选择已生成的回放，或切换实时仿真。</p></div>
-          <div class="map-legend"><span><i class="legend-line uav"></i>无人机</span><span><i class="legend-line ship"></i>科考船</span><span><i class="legend-sector"></i>雷达视场</span><span id="visit-key"><i class="legend-visit"></i>经过：新深 → 旧浅</span></div>
+          <div class="map-legend"><span><i class="legend-line uav"></i>无人机</span><span><i class="legend-line ship"></i>科考船</span><span><i class="legend-sector"></i><span id="radar-key-label">雷达视场</span></span><span id="visit-key"><i class="legend-visit"></i>经过：新深 → 旧浅</span></div>
           <div class="scale-bar"><i id="scale-line"></i><span id="scale-label">50 km</span></div>
           <div class="age-key" id="age-key"><span>雷达近期观测</span><i></i><span>陈旧 / 未覆盖</span></div>
-          <div id="potential-key" class="potential-key" hidden><span>−2 雷云</span><span>−1 斥力</span><span>+1 引力</span></div>
         </div>
         <div class="map-bottom"><span><i class="air-dot"></i>云区：空中禁入 <b id="cloud-count">—</b></span><span><i class="sea-dot"></i>岛屿：海面禁入 <b id="island-count">—</b></span><span class="map-hint">拖动平移 · 滚轮缩放</span></div>
       </section>
@@ -71,25 +111,10 @@
           <div class="platform"><img src="/figs/research-vessel.jpg" alt="科考船 R/V Atlantis 真实照片，作为科考船外观参考" width="84" height="64"><div class="platform-content"><h3><i class="platform-dot ship"></i>科考船 <span>海面平台</span></h3><div class="platform-values"><span><b id="ship-speed">—</b> m/s</span><span>航向 <b id="ship-heading">—</b>°</span></div><div class="platform-secondary">实际舵角 <span id="ship-rudder">—</span>°</div></div></div>
         </section>
         <div class="sensor-row"><span>雷达方位偏置</span><b id="radar-offset">—</b><span>有效距离</span><b id="radar-range">—</b></div>
-        <details class="asset-credits"><summary>素材与显示说明</summary><p>照片为真实外观参考；二维模型按物理长宽与地图比例绘制，过小时保留最小可见像素，并沿实际速度旋转。雷达始终使用仿真物理距离。经过网格仅记录UAV通行，按仿真时间渐淡，区别于雷达覆盖年龄。航向 0° 指向 +X（东），逆时针为正。云区与岛屿边界来自仿真，海水纹理不代表真实地理。</p><a href="/figs/sources.json" target="_blank" rel="noopener">图片来源、许可与处理记录 ↗</a></details>
+        <details class="asset-credits"><summary>素材与显示说明</summary><p>照片为真实外观参考；二维模型按物理长宽与地图比例绘制，过小时保留最小可见像素，并沿实际速度旋转。雷达始终使用仿真物理距离。经过网格仅记录UAV通行，按仿真时间渐淡，区别于雷达覆盖年龄。引斥场色深表示场值绝对大小，箭头由相邻栅格差分计算，指向偏好值增大的方向；平坦区域无方向箭头，无效栅格不参与计算。航向 0° 指向 +X（东），逆时针为正。云区与岛屿边界来自仿真，海水纹理不代表真实地理。</p><a href="/figs/sources.json" target="_blank" rel="noopener">图片来源、许可与处理记录 ↗</a></details>
       </aside>
     </main>
 
-    <section class="playback" aria-label="回放控制">
-      <button id="play" class="play-button" aria-label="播放回放" disabled><svg id="play-icon" viewBox="0 0 24 24"><path d="m9 5 11 7-11 7Z"/></svg></button>
-      <button id="restart" class="icon-button" aria-label="从头回放" title="从头回放"><svg viewBox="0 0 20 20"><path d="M4 4v12M15 4 6 10l9 6Z"/></svg></button>
-      <div class="time-display"><strong id="current-time">00:00</strong><span>/ <span id="total-time">00:00</span></span></div>
-      <div class="timeline"><label class="sr-only" for="seek">回放时间</label><input id="seek" type="range" min="0" max="0" value="0" step="1" disabled><div class="timeline-ticks"><span>起点</span><span id="timeline-middle">—</span><span id="timeline-end">终点</span></div></div>
-      <label class="sr-only" for="speed">回放速度</label><select id="speed" class="speed-select"><option value="1">1×</option><option value="5">5×</option><option value="20">20×</option><option value="60" selected>60×</option><option value="120">120×</option></select>
-      <div class="frame-count" id="frame-count">0 帧</div>
-    </section>
-    <section class="recording-bar" aria-label="任务画面录制">
-      <div class="recording-label"><i aria-hidden="true"></i><span>任务录像</span><small id="recording-settings">读取录制设置…</small></div>
-      <button id="record-start" class="record-button" disabled>开始录制</button>
-      <button id="record-stop" class="record-button secondary" disabled>停止并保存</button>
-      <output id="recording-status" role="status" aria-live="polite">准备录制</output>
-      <a id="recording-download" hidden download>下载 MP4 ↗</a>
-    </section>
     <div id="run-status" class="run-status" role="status" aria-live="polite" hidden></div>
     <footer class="status-bar"><span id="status" role="status" aria-live="polite">正在读取本地回放记录…</span><span>坐标与距离使用米制 · 所有指标来自仿真</span></footer>
   </div>

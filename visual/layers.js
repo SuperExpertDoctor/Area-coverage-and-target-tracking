@@ -8,6 +8,7 @@ export const VISUAL_DEFAULTS = Object.freeze({
   visual_trail_seconds:60, visual_show_grid:true, visual_show_trail:true, visual_show_radar_age:true,
   visual_trail_style:'meteor',
   visual_show_potential:true,
+  visual_show_field_vectors:true,
 });
 
 export function potentialCellBounds(field,row,col,roi=null) {

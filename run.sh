@@ -8,16 +8,15 @@ cd "$ROOT_DIR"
 PYTHON="${PYTHON:-python}"
 MODE="${1:-formal}"
 if (($#)); then shift; fi
-OUTPUT_DIR="outputs/formal"
-TF_LOG_DIR="tf-logs/formal"
+OUTPUT_DIR="outputs"
+TF_LOG_DIR="tf-logs"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-formal}"
 RUN_NAME="formal-1000"
 # Optional explicit inputs. Empty strings use the task's standard output paths.
 CHECKPOINT_PATH=""
 SPLIT_REFERENCE_CHECKPOINT=""
 RESUME_CHECKPOINT=""
 DATASET_MANIFEST=""
-export PYTHONPYCACHEPREFIX="outputs/cache/python"
-export MPLCONFIGDIR="outputs/cache/matplotlib"
 export PYTHONIOENCODING=utf-8
 export PYTHONUNBUFFERED=1
 # Set before NumPy loads in the parent or spawned workers; training sets its
@@ -207,11 +206,12 @@ if [[ -n "$CHECKPOINT_PATH" ]]; then INPUT_ARGS+=(--checkpoint-path "$CHECKPOINT
 if [[ -n "$SPLIT_REFERENCE_CHECKPOINT" ]]; then INPUT_ARGS+=(--split-reference-checkpoint "$SPLIT_REFERENCE_CHECKPOINT"); fi
 if [[ -n "$RESUME_CHECKPOINT" ]]; then INPUT_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT"); fi
 if [[ -n "$DATASET_MANIFEST" ]]; then INPUT_ARGS+=(--dataset-manifest "$DATASET_MANIFEST"); fi
-exec "$PYTHON" main.py \
+# Avoid bytecode writes before main.py validates and scopes runtime cache paths.
+exec "$PYTHON" -B main.py \
   --mode "$MODE" --task both \
   --config-json "$SIM_CONFIG" --field-mask-previous-command --field-frame body --field-cloud-geometry-encoder auto --field-pan-residual --tracking-pan-reference goal --coverage-pan-reference goal --coverage-direction-reference goal_orbit --tracking-direction-reference goal_orbit \
   --closed-loop-selection --selection-coverage-seconds 10800 --selection-tracking-seconds 1800 --selection-render-every 60 --selection-workers 2 --selection-tracking-pan-stress 0.3490658503988659 \
-  --output-dir "$OUTPUT_DIR" --tf-log-dir "$TF_LOG_DIR" --run-name "$RUN_NAME" \
+  --output-dir "$OUTPUT_DIR" --tf-log-dir "$TF_LOG_DIR" --experiment-name "$EXPERIMENT_NAME" --run-name "$RUN_NAME" \
   --visualize --open-browser --keep-server --host 127.0.0.1 --port 8787 \
   --render-every 5 --realtime-factor 0 --progress-every 300 \
   --expert-seed 7100 --collection-seed 12000 \

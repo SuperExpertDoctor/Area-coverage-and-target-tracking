@@ -7,7 +7,10 @@ visual option, or run `python src/visual_server.py --port 8787`, then open
 The static frontend consists of `index.html`, `styles.css`, `app.js` (controls,
 SSE and measured metrics), `map.js` (Cartesian map and loaded 2D model assets),
 `layers.js` (sparse temporal visits, clipped trails and physical model sizing),
-and `replay.js` (replay validation and time lookup). Typography uses locally
+`field.js` (masked preference gradients and screen-space arrow sampling),
+`theme.js` (persisted theme and semantic map colors), `recording.js` (browser
+capture and automatic MP4 upload), and `replay.js` (replay validation and time
+lookup). Typography uses locally
 installed Noto Sans SC / Microsoft YaHei and IBM Plex Mono / Consolas fallbacks;
 there are no remote font requests that can stall an offline/local session.
 
@@ -62,32 +65,77 @@ Asset provenance, licenses and transformations are in `../figs/sources.json`
 and `../figs/ATTRIBUTION.md`. The photographs are downloaded real images. The
 loaded SVG files are original schematic 2D models, not downloaded 3D CAD.
 
+## Attraction and repulsion field controls
+
+The **引斥场色块** and **场方向** switches independently control the scalar
+heatmap and direction arrows. Both use the actual current `frame.potential`.
+The fixed signed scale is coral for hard constraints (-2), mauve for repulsion
+(-1) and green for attraction (+1); greater absolute values have greater opacity.
+Arrows follow **positive preference gradients**, toward higher values. They use
+physical grid spacing with central differences, or one-sided differences beside
+masked/missing cells. Constant regions have no arrows. Masked zeroes never act
+as measured neighbors. Sampling adapts to zoom to keep arrows readable.
+
+The **引斥场** view follows the UAV and fits its local field. The field radius
+comes from sample bounds (normally 6 km); serialized `potential.range=[-2,1]`
+is the scalar value range, not a physical radius. The field legend states its
+sample resolution and radius; the separate radar legend states its actual
+physical range (normally 3 km). Switching tasks/replays retains layer choices.
+Replays without field data show a notice and disable the field camera.
+
+## Top menus, themes and recordings
+
+All task, data, view, playback and recording controls are in the top header.
+The **数据** menu selects live/history sources, actors, replays and local imports.
+The **视图** menu contains camera choices, every visualization switch, trail
+style, zoom/reset and background theme. The **播放** menu contains the timeline,
+speed, play/pause and restart. Menus work with keyboard focus, Space and Escape;
+only one opens at a time. Mobile menus fit the viewport and scroll vertically.
+
+White is the default theme; **视图 → 深海蓝** restores the dark ocean background.
+The choice is remembered in local storage. Both palettes distinguish teal UAVs,
+ochre ships, green islands, slate clouds, visits, radar and signed field values.
+The field legend stays outside the map. Desktop monitoring scrolls independently.
+
+In **录制**, turn on **录制演示** to capture actual replay or live frames. History
+recordings advance through the loaded replay across the configured recording
+duration. Turn the switch off to save early, or wait for automatic completion.
+The server converts the browser capture to H.264 MP4 and saves the video plus
+provenance metadata in its configured `output_dir/recordings`. The menu shows
+capture settings, progress, destination and the saved download link. Capture
+uses the current map theme and layer choices. The `window.maritimeRecording`
+automation API remains available.
+
+On the next algorithm launch, pass `--experiment-name NAME` to place outputs,
+recordings and runtime caches below `outputs/NAME`, and TensorBoard logs below
+`tf-logs/NAME`. `run.sh` uses `formal` by default; `--run-name` remains the run
+directory inside each task's TensorBoard directory. Omit the new argument in
+direct `main.py` calls to retain legacy paths. No running process is restarted.
+
 ## Verification
 
-Run `python -m pytest tests/test_visual_frontend.py -q` for 11 checks against the
-actual ES modules: sparse segment traversal, world clipping, replay rewind,
-live append/trim, revisits, simulation-time fade, minimum-size physical models,
-actual model rotation/radar radius, meteor-window clipping, missing positions,
-and server configuration surviving scene changes. These tests use Node when
-available. Server route/SSE tests remain in `tests/test_visual_server.py`.
+Verification on 2026-11-28 used Playwright CLI with Chromium-based Edge because
+Browser/IAB was unavailable. Actual coverage and tracking preflight replays
+were checked at 1440×1000, 1440×900 and 390×844. Both field switches changed the
+canvas independently, seeking to the end and back restored the exact initial
+bitmap, play/pause worked, and task changes preserved preferences. Checked white
+default, dark persistence, all top menus, keyboard behavior, missing-field replay
+compatibility and mobile overflow, with no browser errors. An isolated test
+server captured and saved a real 640×400, 10 fps, 1.5 s H.264 MP4 through the
+recording switch, and the returned video URL served successfully. Existing
+training and TensorBoard processes were left running.
+`view_image` inspection compared the original and updated screenshots for
+layout, typography, palette, control states, map/legend placement and mobile
+wrapping. No Image Gen tool was available; the existing UI/assets and the
+written design specification were used as references.
 
-Playwright CLI Chromium was used because Browser/IAB tools were unavailable.
-The latest grid/trail UI was inspected with `view_image` at 1440×900 and 390×844,
-including full-world view and the mobile lower panel. Checked grid alignment,
-separate visit/radar colors, Chinese/control typography, real-photo framing,
-small velocity-oriented models, label spacing and responsive layout. Desktop
-playback remains in view and mobile has no horizontal overflow. Browser caches,
-snapshots and screenshots are kept beneath `outputs`; current review images are
-in `outputs/diagnostics/visual-grid/`.
+Run the relevant regression suite with:
 
-Verified the current real coverage replay at t=1300 s (53.0%), pause stability,
-forward/backward seeking without residual future cells, meteor/history/hidden
-trail states, and old replays adopting current display overrides across task
-changes. The radar stays at 3 km. No Image Gen tool was available, so no
-generated concept or comparison
-against a generated concept is claimed.
+```sh
+python -m pytest tests/test_main.py tests/test_field_visual.py tests/test_visual_frontend.py tests/test_visual_theme.py tests/test_visual_server.py tests/test_recording_ui.py tests/test_recording.py -q
+```
 
-The final browser recordings are `coverage-expert-grid.webm` (9.52 s) and
-`tracking-policy-grid.webm` (10.00 s), both 1440×900, beneath
-`outputs/diagnostics/visual-grid/`. These show the real JavaScript UI playing
-recorded frames, including actual metrics, fading visited cells and meteor tails.
+These checks cover physical gradients, masks and thin boundaries, sparse visits,
+replay rewind, physical model/radar sizing, theme persistence, recorder lifecycle,
+server routes/transcoding, safe experiment names and output/log/cache isolation.
+The JavaScript module tests use Node when available.

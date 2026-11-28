@@ -1,6 +1,8 @@
 import {MaritimeMap, finite, position, speedOf, headingDegrees} from './map.js';
 import {validateReplay, frameAtTime, formatTime} from './replay.js';
 import {MissionRecorder} from './recording.js';
+import {fieldGeometry} from './field.js';
+import {readTheme, applyTheme} from './theme.js';
 
 const $ = id => document.getElementById(id);
 const map = new MaritimeMap($('map'));
@@ -15,11 +17,46 @@ let renderQueued = false, trendDirty = true;
 
 function status(message) { $('status').textContent = message; }
 function scheduleRender() { renderQueued = true; trendDirty = true; }
+function setTheme(theme) {
+  const name=applyTheme(theme);map.setTheme(name);
+  document.querySelectorAll('[data-theme-choice]').forEach(button=>{
+    const active=button.dataset.themeChoice===name;
+    button.classList.toggle('active',active);button.setAttribute('aria-pressed',active);
+  });
+  scheduleRender();
+}
+function initializeMenus() {
+  const menus=[...document.querySelectorAll('.menu-bar>.menu')];
+  for(const menu of menus)menu.addEventListener('toggle',()=>{
+    if(menu.open)for(const other of menus)if(other!==menu)other.open=false;
+  });
+  document.addEventListener('pointerdown',event=>{
+    if(!menus.some(menu=>menu.contains(event.target)))menus.forEach(menu=>menu.open=false);
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape')for(const menu of menus)if(menu.open){menu.open=false;menu.querySelector('summary').focus();}
+  });
+  document.querySelectorAll('[data-theme-choice]').forEach(button=>button.addEventListener('click',()=>setTheme(button.dataset.themeChoice)));
+  setTheme(readTheme());
+}
+function updateFieldControls(frame) {
+  const geometry=fieldGeometry(frame?.potential),enabled=map.showPotential||map.showFieldVectors;
+  $('show-field-vectors').checked=map.showFieldVectors;
+  $('potential-key').hidden=!enabled||!geometry;
+  $('potential-scale').hidden=!map.showPotential;
+  $('field-color-key').hidden=!map.showPotential;
+  $('field-vector-key').hidden=!map.showFieldVectors;
+  $('field-notice').hidden=!frame||!enabled||Boolean(geometry);
+  if(geometry){
+    $('field-resolution').textContent=`${geometry.rows} × ${geometry.cols} · R ${(geometry.radius/1000).toFixed(1)} km`;
+  }
+  document.querySelectorAll('[data-view="field"]').forEach(button=>button.disabled=!geometry);
+}
 function updateLayerControls() {
   $('show-grid').checked=map.showGrid;$('show-trail').checked=map.showTrail;
   $('show-age').checked=map.showAge;$('show-age').parentElement.hidden=state.task!=='coverage';
   $('show-potential').checked=map.showPotential;
-  $('potential-key').hidden=!map.showPotential||!state.replay?.frames?.[state.index]?.potential;
+  updateFieldControls(state.replay?.frames?.[state.index]);
   $('age-key').hidden=state.task!=='coverage'||!map.showAge;
   $('trail-style').value=map.trailStyle;$('trail-style').disabled=!map.showTrail;
   $('trail-style').querySelector('[value="meteor"]').textContent=`流星尾迹 · ${map.config.visual_trail_seconds}s`;
@@ -157,7 +194,9 @@ function render() {
   renderQueued=false;
   const replay=state.replay,frames=replay?.frames||[],frame=frames[state.index],coverage=frame?.coverage||{},radar=frame?.radar||{},metrics=frame?.metrics||{};
   const hasFrame=Boolean(frame);
-  $('potential-key').hidden=!map.showPotential||!frame?.potential;
+  const recorder=window.maritimeRecording?.recorder;
+  if(recorder)$('record-toggle').disabled=!recorder.config||['loading','preparing','saving'].includes(recorder.status)||(!hasFrame&&!recorder.active);
+  updateFieldControls(frame);
   $('empty-state').hidden=hasFrame;
   $('data-label').textContent=hasFrame?(state.mode==='live'?'LIVE':'REPLAY'):'无数据';
   $('data-label').style.color=hasFrame?'var(--cyan)':'';
@@ -182,6 +221,7 @@ function render() {
   $('ship-rudder').textContent=numeric(radians(frame?.ship?.rudder),1);
   $('radar-offset').textContent=Number.isFinite(radar.offset)?`${numeric(radians(radar.offset))}°`:'—';
   $('radar-range').textContent=Number.isFinite(radar.range)?`${numeric(radar.range/1000,1)} km`:'—';
+  $('radar-key-label').textContent=Number.isFinite(radar.range)?`雷达 · ${numeric(radar.range/1000,1)} km`:'雷达视场';
   $('current-time').textContent=formatTime(frame?.t);
   $('total-time').textContent=state.mode==='live'?'LIVE':formatTime(frames.at(-1)?.t);
   $('timeline-middle').textContent=frames.length?formatTime((frames[0].t+frames.at(-1).t)/2):'—';
@@ -198,7 +238,7 @@ function drawTrend() {
   trendDirty=false;const canvas=$('trend'),rect=canvas.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(1,rect.width),h=Math.max(1,rect.height);
   canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.scale(dpr,dpr);
   const frames=state.replay?.frames||[];
-  c.strokeStyle='#526d822e';c.lineWidth=1;
+  c.strokeStyle=map.palette.grid;c.lineWidth=1;
   for(const yy of [h*.2,h*.6,h-6]){c.beginPath();c.moveTo(0,yy);c.lineTo(w,yy);c.stroke();}
   if(!frames.length){$('trend-range').textContent='—';return;}
   const getValue=f=>state.task==='coverage'?f.coverage?.ratio*100:f.metrics?.distance/1000;
@@ -209,10 +249,11 @@ function drawTrend() {
   const xy=p=>[(p.t-t0)/Math.max(t1-t0,1)*(w-2)+1,h-7-(p.v-min)/(max-min)*(h-16)];
   const stride=Math.max(1,Math.floor(points.length/700));c.beginPath();
   points.forEach((p,i)=>{if(i%stride&&i!==points.length-1)return;const pos=xy(p);i?c.lineTo(...pos):c.moveTo(...pos);});
-  c.lineWidth=1.4;c.strokeStyle='#70ddd6';c.stroke();
+  const accent=map.palette.uav;
+  c.lineWidth=1.4;c.strokeStyle=accent;c.stroke();
   const last=xy(points.at(-1)),first=xy(points[0]);c.lineTo(last[0],h-6);c.lineTo(first[0],h-6);c.closePath();
-  const grad=c.createLinearGradient(0,5,0,h);grad.addColorStop(0,'#70ddd622');grad.addColorStop(1,'#70ddd600');c.fillStyle=grad;c.fill();
-  const current=points.findLast(p=>p.i<=state.index);if(current){const p=xy(current);c.beginPath();c.moveTo(p[0],0);c.lineTo(p[0],h-5);c.setLineDash([2,3]);c.strokeStyle='#9eb6c37a';c.lineWidth=1;c.stroke();c.setLineDash([]);c.beginPath();c.arc(...p,3,0,Math.PI*2);c.fillStyle='#b1f4e7';c.fill();}
+  const grad=c.createLinearGradient(0,5,0,h);grad.addColorStop(0,`${accent}22`);grad.addColorStop(1,`${accent}00`);c.fillStyle=grad;c.fill();
+  const current=points.findLast(p=>p.i<=state.index);if(current){const p=xy(current);c.beginPath();c.moveTo(p[0],0);c.lineTo(p[0],h-5);c.setLineDash([2,3]);c.strokeStyle=map.palette.gridText;c.lineWidth=1;c.stroke();c.setLineDash([]);c.beginPath();c.arc(...p,3,0,Math.PI*2);c.fillStyle=accent;c.fill();}
 }
 
 function connectLive() {
@@ -279,12 +320,13 @@ document.querySelectorAll('[data-view]').forEach(button=>button.addEventListener
 $('zoom-in').addEventListener('click',()=>map.adjustZoom(1.4));$('zoom-out').addEventListener('click',()=>map.adjustZoom(1/1.4));$('reset-view').addEventListener('click',()=>map.reset());
 $('show-age').addEventListener('change',()=>{map.setLayerOptions({showAge:$('show-age').checked});updateLayerControls();});
 $('show-potential').addEventListener('change',()=>{map.setLayerOptions({showPotential:$('show-potential').checked});updateLayerControls();});
+$('show-field-vectors').addEventListener('change',()=>{map.setLayerOptions({showFieldVectors:$('show-field-vectors').checked});updateLayerControls();});
 $('show-grid').addEventListener('change',()=>{map.setLayerOptions({showGrid:$('show-grid').checked});updateLayerControls();});
 $('show-trail').addEventListener('change',()=>{map.setLayerOptions({showTrail:$('show-trail').checked});updateLayerControls();});
 $('trail-style').addEventListener('change',()=>map.setLayerOptions({trailStyle:$('trail-style').value}));
 new ResizeObserver(()=>{trendDirty=true;scheduleRender();}).observe($('trend'));
 window.addEventListener('keydown',event=>{
-  if(event.code==='Space'&&!['INPUT','SELECT','BUTTON','TEXTAREA'].includes(document.activeElement?.tagName)){
+  if(event.code==='Space'&&!['INPUT','SELECT','BUTTON','TEXTAREA','SUMMARY'].includes(document.activeElement?.tagName)){
     if(state.mode==='history'&&state.replay?.frames.length){event.preventDefault();$('play').click();}
   }
 });
@@ -300,7 +342,7 @@ function tick(now) {
   if(renderQueued)render();map.draw();requestAnimationFrame(tick);
 }
 updateChoices();activateReplay(null);loadVisualConfig();refreshCatalog(true);connectLive();requestAnimationFrame(tick);
-if(typeof location!=='undefined')initializeRecording();
+if(typeof location!=='undefined'){initializeMenus();initializeRecording();}
 setInterval(()=>refreshCatalog(state.mode==='history'&&!state.replay),15000);
 
 function displayRunStatus(run) {
@@ -327,14 +369,18 @@ function initializeRecording() {
     },
     onState:({status,message,active,result})=>{
       $('recording-status').textContent=message;$('recording-status').dataset.state=status;
-      $('record-start').disabled=active||status==='loading'||status==='preparing'||status==='saving'||!recorder?.config;
-      $('record-stop').disabled=!active;
+      $('record-toggle').checked=active||status==='preparing';
+      $('record-toggle').disabled=['loading','preparing','saving'].includes(status)||!recorder?.config||(!state.replay?.frames.length&&!active);
+      $('recording-menu-label').textContent=active?'录制中':'录制';
+      $('recording-indicator').hidden=!active;
       $('recording-download').hidden=!result;
-      if(result){$('recording-download').href=result.url;$('recording-download').download=result.path.split(/[\\/]/).pop();}
+      if(result){$('recording-download').href=result.url;$('recording-download').download=result.path.split(/[\\/]/).pop();$('recording-destination').textContent=result.path;}
     }});
-  const reportError=error=>recorder.fail(error);
-  $('record-start').addEventListener('click',()=>recorder.start({fullReplay:state.mode==='history'}).catch(reportError));
-  $('record-stop').addEventListener('click',()=>recorder.stop());
+  const reportError=error=>status(`录制操作失败：${error.message}`);
+  $('record-toggle').addEventListener('change',()=>{
+    if($('record-toggle').checked)recorder.start({fullReplay:state.mode==='history'}).catch(reportError);
+    else recorder.stop()?.catch(reportError);
+  });
   const load=async url=>{
     const resolved=new URL(url,location.href);
     if(resolved.origin!==location.origin||!resolved.pathname.startsWith('/outputs/'))throw new Error('Replay URL must be same-origin under /outputs/');
@@ -346,7 +392,8 @@ function initializeRecording() {
     info:()=>({status:recorder.status,error:recorder.error,result:recorder.result,...snapshot()}),
     recordReplay:async options=>{await recorder.start({fullReplay:true,...options});return recorder.completion;},
     stop:()=>recorder.stop()};
-  recorder.ready.then(config=>{if(config)$('recording-settings').textContent=`${config.recording_width} × ${config.recording_height} · ${config.recording_fps} FPS · ${config.recording_duration_seconds}s`;
+  recorder.ready.then(config=>{if(config){$('recording-settings').textContent=`${config.recording_width} × ${config.recording_height} · ${config.recording_fps} FPS · ${config.recording_duration_seconds}s 后自动保存`;
+    $('recording-destination').textContent=config.output_directory||'当前实验 outputs / recordings';}
     const replayUrl=new URLSearchParams(location.search).get('replay');if(replayUrl)load(replayUrl).catch(reportError);
   });
   if(new URLSearchParams(location.search).has('replay'))state.deepLink=true;

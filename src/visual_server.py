@@ -186,7 +186,9 @@ class VisualServer:
                     if not head:self.wfile.write(data)
                     return
                 if path == '/api/recording-config':
-                    data = json.dumps(service.recording_config, allow_nan=False).encode('utf-8')
+                    config = dict(service.recording_config,
+                                  output_directory=str(service.output_dir / 'recordings'))
+                    data = json.dumps(config, ensure_ascii=False, allow_nan=False).encode('utf-8')
                     self._headers(200, 'application/json; charset=utf-8', len(data))
                     if not head:self.wfile.write(data)
                     return
