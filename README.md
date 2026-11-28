@@ -13,6 +13,108 @@
 
 雷云约束无人机，岛屿约束船舶；无人机可飞越岛屿。策略输入包含船舶真实状态，雷达可见性另行计算。有限时域测试不代表任意场景下的安全保证，训练误差也不等同于任务成功率。
 
+## 算法
+
+本项目采用带时序记忆的**行为克隆（Behavior Cloning，BC）**：先由启发式专家生成状态—动作示教序列，再用 CNN + MLP + GRU 学习控制策略，最后在真实运动学与雷达约束下闭环执行。区域覆盖和目标跟踪分别维护专家、数据集、策略参数及隐藏状态。
+
+![行为克隆算法工作逻辑：专家示教、FieldPolicy 网络、训练目标与在线闭环](assets/fig.png)
+
+*图1：算法整体流程。图中的 MSE 表示动作平方误差；代码中 `Loss` 与按动作分量平均的 `Action_MSE` 的关系见下文。*
+
+### 任务目标与物理约束
+
+覆盖任务关注有效海面上的首扫覆盖率和持续重访。令 $\mathcal{G}_{\mathrm{water}}$ 为排除岛屿后的有效栅格，$\tau_g$ 为栅格最近一次被实际雷达扫描的时刻，则：
+
+$$
+C(t)=\frac{1}{|\mathcal{G}_{\mathrm{water}}|}\sum_{g\in\mathcal{G}_{\mathrm{water}}}\mathbf{1}\{\tau_g\geq 0\},
+\qquad
+\bar A(t)=\frac{1}{|\mathcal{G}_{\mathrm{water}}|}\sum_{g\in\mathcal{G}_{\mathrm{water}}} A_g(t).
+$$
+
+其中已扫描格的年龄 $A_g(t)=t-\tau_g$，未扫描格的年龄为 $t$。任务希望提高 $C(t)$、降低平均及最大扫描年龄；首次达到100%覆盖后仍继续重访。
+
+跟踪任务希望目标始终位于真实雷达距离和扇形内。按物理更新步统计，可见比例为：
+
+$$
+Q_{\mathrm{track}}=\frac{1}{K}\sum_{k=1}^{K}
+\mathbf{1}\!\left\{d_k\leq R,\quad
+\left|\operatorname{wrap}(\vartheta_k-\psi_k-\gamma_k)\right|\leq\alpha\right\}.
+$$
+
+$K$ 为回合内物理更新步数，$d_k$ 为机船距离，$\vartheta_k$ 为目标方位，$\psi_k$ 为无人机航向，$\gamma_k$ 为雷达实际偏角，$R$ 和 $\alpha$ 分别为雷达距离与半角。任务目标为 $Q_{\mathrm{track}}=1$ 且全程无丢失，同时满足云区、岛屿、世界边界及平台操纵约束。这些是任务评估指标，网络参数通过后述示教损失优化。
+
+### 专家示教与局部引斥场
+
+两类专家仅使用与网络相同的公开观测。覆盖专家结合公共补扫目标、候选航向和雷达扇形收益安排扫描；跟踪专家利用船舶相对运动建立绕飞方向，并根据目标方位及其变化计算雷达指令。专家的有限时域物理预测负责筛查云区和边界风险。
+
+局部场以无人机为中心，四个通道分别表示**偏好值、任务海面、硬约束和圆形有效范围**。覆盖任务中，对已经扫描过的海面格，年龄偏好采用归一化指数函数：
+
+$$
+P_{\mathrm{scan}}(a)=-1+2\frac{1-\exp(-\kappa\rho)}{1-\exp(-\kappa)},
+\qquad \rho=\operatorname{clip}\!\left(\frac{a}{T_r},0,1\right).
+$$
+
+$a$ 为扫描年龄，$T_r$ 为重访周期，$\kappa>0$ 控制增长速度。新近扫描时偏好为 $-1$，达到重访周期时为 $+1$，未扫描格直接取 $+1$；云区和越界区域另以硬约束通道标记。跟踪任务使用围绕移动目标的距离偏好。前端箭头表示场值差分方向，实际控制还结合绕飞目标、雷达收益和物理可行性。实现见 [potential_field.py](src/potential_field.py) 与 [expert_field.py](src/expert_field.py)。
+
+### 多模态时序策略网络
+
+下表对应当前 `obs-field-v2` 与正式脚本默认配置：
+
+| 输入分支 | 观测内容与形状 | 编码特征 |
+| --- | --- | --- |
+| 物理向量 | `vector[111]`（覆盖）或 `vector[134]`（跟踪） | MLP → 128维 |
+| 局部场 | `potential[4,33,33]` | CNN → 128维 |
+| 场上下文 | `field_context[16]` | MLP → 64维 |
+| 云几何增强 | 从公开云几何提取；默认仅覆盖启用 | 共享 MLP + 汇聚 → 64维 |
+
+默认覆盖拼接384维特征、跟踪拼接320维特征，再送入隐藏维度为128的 GRU：
+
+$$
+z_t=\operatorname{Encode}_{\theta}(o_t),\qquad
+h_t=\operatorname{GRU}_{\theta}(z_t,h_{t-1}),\qquad
+\hat a_t=g_{\theta}(h_t,o_t)=(\hat u_{x,t},\hat u_{y,t},\hat p_t).
+$$
+
+方向与雷达头在当前观测导出的几何参考上学习残差，输出世界坐标系单位期望方向 $\|\hat{\boldsymbol u}_t\|_2=1$ 及归一化雷达指令 $\hat p_t\in[-1,1]$。正式配置在网络内部采用机体坐标编码，并默认屏蔽上一时刻方向命令；外部观测和输出仍采用世界坐标。实现见 [policy_field.py](src/policy_field.py)。
+
+### 优化目标
+
+示教数据由观测 $o_{it}$ 与专家指令 $a^*_{it}$ 组成，训练标签是专家请求的动作。设一个序列批次含 $B$ 个回合，$m_{it}\in\{0,1\}$ 表示该位置是否为有效动作标签，则默认行为克隆数据损失为：
+
+$$
+\mathcal{L}_{\mathrm{BC}}(\theta)=
+\frac{\sum_{i=1}^{B}\sum_t m_{it}\left\|\hat a_{it}-a^*_{it}\right\|_2^2}
+{\sum_{i=1}^{B}\sum_t m_{it}}.
+$$
+
+Adam 根据该损失更新网络，并通过 `--weight-decay` 施加 L2 正则，对应优化目标：
+
+$$
+\theta^*=\arg\min_{\theta}\left[\mathcal{L}_{\mathrm{BC}}(\theta)
++\frac{\lambda_{\mathrm{wd}}}{2}\|\theta\|_2^2\right].
+$$
+
+动作包含世界 XY 方向与归一化雷达偏角三个分量。默认 `Loss` 对三个分量的平方误差求和，再对有效时间步平均；`Action_MSE` 再按三个动作分量平均，因此默认有 $\mathrm{Action\_MSE}=\mathcal{L}_{\mathrm{BC}}/3$。padding 不计入分子或分母，TensorBoard 的 `Loss` 不包含优化器的 L2 正则项。
+
+启用专家纠正加权或倾斜辅助损失时，数据损失扩展为：
+
+$$
+\mathcal{L}_{\mathrm{train}}(\theta)=
+\frac{\sum_{i,t}m_{it}w_{it}\left[\|\hat a_{it}-a^*_{it}\|_2^2
++\lambda_{\mathrm{steer}}\ell^{\mathrm{steer}}_{it}\right]}
+{\sum_{i,t}m_{it}w_{it}}.
+$$
+
+当专家 XY 指令与观测中的上一条方向命令之差超过 `--correction-threshold` 时，$w_{it}$ 取 `--correction-weight-max`，否则为1；默认所有权重均为1。$\ell^{\mathrm{steer}}$ 为针对专家请求倾斜的超额 BCE 辅助损失，扣除专家基线后取非负值，默认 $\lambda_{\mathrm{steer}}=0$。Adam 此时优化扩展数据损失加 L2 正则。纠正加权仅在训练更新时启用，基线与验证均取 $w_{it}=1$；开启倾斜辅助项时，验证 `Loss` 也包含该项，原始 `Action_MSE/MAE` 始终只统计未加权的动作误差。实现见 [train.py](src/train.py)。
+
+### 从示教到闭环评估
+
+1. **构建数据集**：随机初始化场景，由对应专家与环境交互；NPZ 保存完整观测和动作，权威清单仅纳入接受的示教回合。
+2. **划分与训练**：按场景组划分训练/验证集，仅在训练集拟合归一化。采用序列 mini-batch 与 TBPTT，回合开始重置 GRU，连续分块间传递并 detach 隐藏状态；每个训练批次执行梯度裁剪与 Adam 更新，训练和无梯度验证批次分别写入指标。
+3. **可选 DAgger**：仅在训练场景上让当前策略访问状态，由专家重新标注，并将接受的样本聚合回示教集。混合执行动作与专家标签分别保存，验证和最终测试场景保持独立。
+4. **在线执行**：循环执行“当前观测 → 策略与隐藏状态 → 方向/雷达指令 → 物理推进 → 下一观测”。飞行方向经过有限倾斜响应，雷达偏角受转速限制；可选 `forecast` 安全层还会独立检查候选动作的有限时域物理可行性。
+5. **独立评估**：训练/验证完成后固定 `last.pt` 的 SHA，每任务默认运行30个独立回合，保存实际轨迹及回合级结果。验证误差用于训练诊断，最终任务成功率单独统计，测试结果不参与权重选择。
+
 ## 安装
 
 需要 Python 3.10+，Windows 推荐 Git Bash；GPU 训练需要与驱动匹配的 PyTorch。
