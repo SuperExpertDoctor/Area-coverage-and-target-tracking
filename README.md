@@ -120,8 +120,8 @@ $$
 需要 Python 3.10+，Windows 推荐 Git Bash；GPU 训练需要与驱动匹配的 PyTorch。
 
 ```bash
-git clone https://github.com/SuperExpertDoctor/Area-coverage-and-target-tracking.git
-cd Area-coverage-and-target-tracking
+git clone https://github.com/SuperExpertDoctor/Area-coverage-Target-tracking-by-BC.git
+cd Area-coverage-Target-tracking-by-BC
 python -m venv .venv
 source .venv/bin/activate
 # Windows Git Bash 改用：source .venv/Scripts/activate
