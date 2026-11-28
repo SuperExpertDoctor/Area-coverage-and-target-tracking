@@ -51,23 +51,26 @@ def test_failed_rerun_cannot_leave_a_stale_training_cache(tmp_path):
     np.savez(cache,actions=np.ones((2,2)))
     record,path=module.run_episode(Env(),Actor(),seed=1,actor_name='expert',
         output_dir=tmp_path,name='repeat',record_observations=True)
-    assert not cache.exists()
+    assert cache.exists()
+    assert path==cache
+    assert not path.with_suffix('.json').exists()
     assert record['summary']['terminated']
     assert record['summary']['planning_failure']['type']=='PlanningError'
-    assert json.loads(path.read_text(encoding='utf-8'))['metadata']['expert_valid'] is False
+    assert module.load_episode(path)['metadata']['expert_valid'] is False
 
 
-def test_reset_failure_also_invalidates_the_old_training_cache(tmp_path):
+def test_reset_failure_preserves_the_previous_archive_until_atomic_replacement(tmp_path):
     module=importlib.import_module('rollouts')
     import pytest
     class Env:
         def reset(self, **kwargs): raise ValueError('invalid replay scene')
     cache=tmp_path/'repeat.npz'
     np.savez(cache,actions=np.ones((2,2)))
+    previous=cache.read_bytes()
     with pytest.raises(ValueError,match='invalid replay scene'):
         module.run_episode(Env(),None,seed=1,actor_name='expert',output_dir=tmp_path,
                            name='repeat',record_observations=True)
-    assert not cache.exists()
+    assert cache.read_bytes()==previous
 
 
 def test_dagger_cache_restores_expert_labels_not_behavior_actions(tmp_path):
@@ -122,7 +125,7 @@ def test_live_dagger_scene_identifies_training_mixture(tmp_path):
     assert event.get('metadata') == expected
     assert all(record['metadata'][key] == value for key, value in expected.items())
     assert record['metadata']['policy_checkpoint'] == Actor.checkpoint_metadata
-    saved=json.loads((tmp_path/'dagger.json').read_text(encoding='utf-8'))
+    saved=module.load_episode(tmp_path/'dagger.npz')
     assert saved['metadata']['policy_checkpoint'] == Actor.checkpoint_metadata
 
     deployment = Server()
@@ -183,11 +186,11 @@ def test_constraint_rollout_keeps_raw_admitted_and_actual_commands_distinct(tmp_
     np.testing.assert_allclose(record['executed_actions'], [[.6, .8, .1]])
     assert record['constraint_interventions'] == [True]
     assert record['metadata']['expert_valid'] is False
-    assert not path.with_suffix('.npz').exists()
+    assert path.suffix=='.npz' and path.exists()
     scene = server.events[0]
     assert scene['metadata']['control_mode'] == 'forecast_constraint'
     assert scene['metadata']['policy_constraints']['interventions'] == 0  # immutable initial snapshot
-    saved = json.loads(path.read_text(encoding='utf-8'))
+    saved = module.load_episode(path)
     assert saved['raw_policy_actions'] == record['raw_policy_actions']
     index = json.loads(path.with_suffix('.replay-index.json').read_text(encoding='utf-8'))
     assert index['entry']['control_mode'] == 'forecast_constraint'
@@ -264,7 +267,9 @@ def test_only_dagger_keeps_valid_labels_before_a_failed_behavior(tmp_path, failu
         actor_name='policy' if dagger else 'expert', output_dir=tmp_path, name='prefix',
         record_observations=True, expert_labeler=Teacher() if dagger else None, mixture_beta=0.)
     assert record['metadata']['expert_valid'] is accepted
-    assert path.with_suffix('.npz').exists() is accepted
+    assert path.suffix=='.npz' and path.exists()
+    assert not path.with_suffix('.json').exists()
+    assert module.load_episode(path)['metadata']['expert_valid'] is accepted
     if failure == 'tracking_loss':
         assert record['summary']['first_loss_time'] == 1.
     else:
@@ -361,3 +366,27 @@ def test_replay_cadence_requires_a_positive_integer(tmp_path, cadence):
     with pytest.raises(ValueError, match='cadence'):
         module.run_episode(_SparseEnv(), _SparseActor(), seed=1, actor_name='expert',
             output_dir=tmp_path, name='invalid-cadence', replay_every=cadence)
+
+
+@pytest.mark.parametrize('failure',['invalid_action','environment_error'])
+def test_unexpected_runtime_failures_archive_the_completed_prefix_before_propagating(tmp_path,failure):
+    module=importlib.import_module('rollouts')
+    class Actor(_SparseActor):
+        def act(self,obs):
+            if failure=='invalid_action' and obs['vector'][0]==1:
+                return np.array([float('nan'),0.,0.],np.float32)
+            return super().act(obs)
+    class Env(_SparseEnv):
+        def step(self,action):
+            if failure=='environment_error' and self.t==1:raise RuntimeError('physical step failed')
+            return super().step(action)
+    with pytest.raises((ValueError,RuntimeError)):
+        module.run_episode(Env(),Actor(),seed=1,actor_name='expert',output_dir=tmp_path,
+            name='failed-prefix',record_observations=True,replay_every=5)
+    path=tmp_path/'failed-prefix.npz'
+    assert path.is_file() and not path.with_suffix('.json').exists()
+    record=module.load_episode(path)
+    assert record['summary']['steps']==1 and record['metadata']['expert_valid'] is False
+    assert len(record['actions'])==len(record['executed_actions'])==1
+    assert module.decode_array(record['observations']['vector']).shape==(2,111)
+    assert record['frames'][-1]['t']==1

@@ -22,9 +22,14 @@ stop. The `url` and bound `port` properties are available; port 0 selects a free
 port. Browser connections and queued frames are bounded. Slow viewers skip old
 frames rather than blocking simulation.
 
-`/events` is SSE. `/api/replays` lists replay JSON beneath the configured output
+`/events` is SSE. `/api/replays` lists NPZ and legacy JSON replays beneath the configured output
 directory, excluding caches, hidden directories and logs. Files are served
 read-only from `/visual/`, `/figs/`, and `/outputs/`; the root serves the UI.
+GET on a replay `.npz` returns its JSON representation without decompressing
+training observations or persisting a second trajectory. The archive SHA is
+returned in `X-Replay-SHA256` for recording provenance. Local NPZ imports use
+the bounded same-origin `POST /api/replays/convert` endpoint; local JSON imports
+remain in the browser. NPZ uses numeric arrays and UTF-8 metadata, never pickle.
 Traversal and symlinks escaping these roots are rejected.
 
 `/api/visual-config` supplies the current entry-point display parameters. Only
@@ -58,7 +63,7 @@ recorded physical range times map scale; icon size never changes it.
 
 Coverage opens at the task ROI; tracking follows the vessel. Full world,
 follow-UAV, zoom and pan remain available. Historical playback supports pause,
-seek, restart and 1–120× speed. Local JSON imports stay in the browser and are
+seek, restart and 1–120× speed. Local JSON/NPZ imports are
 listed alongside the recorded replays for the current task and policy.
 
 Asset provenance, licenses and transformations are in `../figs/sources.json`
@@ -101,13 +106,14 @@ In **录制**, turn on **录制演示** to capture actual replay or live frames.
 recordings advance through the loaded replay across the configured recording
 duration. Turn the switch off to save early, or wait for automatic completion.
 The server converts the browser capture to H.264 MP4 and saves the video plus
-provenance metadata in its configured `output_dir/recordings`. The menu shows
+provenance metadata in its configured `output_dir/logs/recordings`. The menu shows
 capture settings, progress, destination and the saved download link. Capture
 uses the current map theme and layer choices. The `window.maritimeRecording`
 automation API remains available.
 
 On the next algorithm launch, pass `--experiment-name NAME` to place outputs,
-recordings and runtime caches below `outputs/NAME`, and TensorBoard logs below
+datasets, weights, logs and independent evaluations below `outputs/NAME`.
+Recordings are in `logs/recordings`, runtime caches in `logs/cache`, and TensorBoard logs below
 `tf-logs/NAME`. `run.sh` uses `formal` by default; `--run-name` remains the run
 directory inside each task's TensorBoard directory. Omit the new argument in
 direct `main.py` calls to retain legacy paths. No running process is restarted.

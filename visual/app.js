@@ -151,7 +151,7 @@ async function refreshCatalog(autoLoad=false) {
     const records=renderCatalog();
     if(autoLoad&&state.mode==='history'&&!state.replay&&!state.deepLink){
       if(records.length)await loadReplay($('replay-select').value);
-      else {status('暂无已生成回放；运行专家采集或策略评估后，记录会自动显示。');$('empty-message').textContent='运行仿真生成回放，或通过「导入 JSON」打开本地记录。';}
+      else {status('暂无已生成回放；运行专家采集或策略评估后，记录会自动显示。');$('empty-message').textContent='运行仿真生成回放，或通过「导入 NPZ / JSON」打开本地记录。';}
     }
   } catch(error) {
     if(!state.replay)status(`无法读取回放列表：${error.message}。请通过本地可视化服务器打开本页。`);
@@ -160,7 +160,7 @@ async function refreshCatalog(autoLoad=false) {
   }
 }
 async function loadReplay(url) {
-  if(!url){activateReplay(null);status('暂无该任务与策略的回放，可导入 JSON 文件。');return;}
+  if(!url){activateReplay(null);status('暂无该任务与策略的回放，可导入 NPZ / JSON 文件。');return;}
   const token=++state.loadToken;setPlaying(false);status('正在加载回放…');
   activateReplay(null);status('正在加载回放…');
   try {
@@ -170,6 +170,8 @@ async function loadReplay(url) {
     const response=await fetch(url,{cache:'no-store'});
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const replay=validateReplay(await response.json());
+    const replayHash=response.headers?.get('X-Replay-SHA256');
+    if(replayHash)replay.metadata={...replay.metadata,replay_sha256:replayHash,replay_path:url};
     if(token!==state.loadToken)return;
     state.task=replay.task;state.actor=replay.actor;
     activateReplay(replay,decodeURIComponent(url.split('/').pop()));
@@ -298,7 +300,17 @@ $('refresh').addEventListener('click',()=>refreshCatalog(true));
 $('replay-file').addEventListener('change',async event=>{
   const file=event.target.files[0];if(!file)return;
   try {
-    const replay=validateReplay(JSON.parse(await file.text()));++state.loadToken;state.mode='history';state.task=replay.task;state.actor=replay.actor;
+    let replay;
+    if(file.name.toLowerCase().endsWith('.npz')){
+      if(file.size>128*1024*1024)throw new Error('NPZ 导入上限为 128 MiB');
+      const response=await fetch('/api/replays/convert',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
+      const converted=await response.json();
+      if(!response.ok)throw new Error(converted.error||`HTTP ${response.status}`);
+      replay=validateReplay(converted);
+      const replayHash=response.headers?.get('X-Replay-SHA256');
+      if(replayHash)replay.metadata={...replay.metadata,replay_sha256:replayHash,replay_path:file.name};
+    }else replay=validateReplay(JSON.parse(await file.text()));
+    ++state.loadToken;state.mode='history';state.task=replay.task;state.actor=replay.actor;
     const url=`local:${Date.now()}:${file.name}`;state.localReplays.set(url,{replay,name:file.name});
     state.records.unshift(localReplayRecord(url,replay,file.name));
     renderCatalog();$('replay-select').value=url;activateReplay(replay,file.name);
@@ -393,7 +405,7 @@ function initializeRecording() {
     recordReplay:async options=>{await recorder.start({fullReplay:true,...options});return recorder.completion;},
     stop:()=>recorder.stop()};
   recorder.ready.then(config=>{if(config){$('recording-settings').textContent=`${config.recording_width} × ${config.recording_height} · ${config.recording_fps} FPS · ${config.recording_duration_seconds}s 后自动保存`;
-    $('recording-destination').textContent=config.output_directory||'当前实验 outputs / recordings';}
+    $('recording-destination').textContent=config.output_directory||'当前实验 logs / recordings';}
     const replayUrl=new URLSearchParams(location.search).get('replay');if(replayUrl)load(replayUrl).catch(reportError);
   });
   if(new URLSearchParams(location.search).has('replay'))state.deepLink=true;

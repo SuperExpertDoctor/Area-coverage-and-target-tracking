@@ -1,62 +1,20 @@
-"""Scene-reproducible rollouts, complete JSON records and derived NPZ caches."""
+"""Scene-reproducible rollouts persisted as authoritative NPZ trajectories."""
 from __future__ import annotations
 
-import base64
-from dataclasses import asdict, is_dataclass
 import hashlib
 import json
 import math
 from pathlib import Path
 import time
-import zlib
 
 import numpy as np
 
+try:
+    from .episode_io import json_value, encode_array, decode_array, write_episode, load_episode, load_replay
+except ImportError:
+    from episode_io import json_value, encode_array, decode_array, write_episode, load_episode, load_replay
+
 REPLAY_SCHEMA = 'maritime-replay-v1'
-
-
-def json_value(value):
-    if is_dataclass(value):
-        return json_value(asdict(value))
-    if isinstance(value, dict):
-        return {str(k): json_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_value(v) for v in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def encode_array(array):
-    """Lossless numeric payload inside JSON; no pickle or external binary required."""
-    a = np.ascontiguousarray(array)
-    if a.dtype.hasobject or not np.isfinite(a).all():
-        raise ValueError('Training arrays must be finite numeric values')
-    return {'encoding': 'zlib+base64', 'dtype': a.dtype.str,
-            'shape': list(a.shape),
-            'data': base64.b64encode(zlib.compress(a.tobytes(), level=6)).decode('ascii')}
-
-
-def decode_array(payload):
-    if payload.get('encoding') != 'zlib+base64':
-        raise ValueError('Unsupported array encoding')
-    dtype = np.dtype(payload['dtype'])
-    if dtype.hasobject or dtype.kind not in 'biuf':
-        raise ValueError('Unsupported array dtype')
-    shape = tuple(int(n) for n in payload['shape'])
-    if any(n < 0 for n in shape):
-        raise ValueError('Invalid array shape')
-    raw = zlib.decompress(base64.b64decode(payload['data'], validate=True))
-    if len(raw) != math.prod(shape) * dtype.itemsize:
-        raise ValueError('Array shape does not match its contents')
-    result = np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
-    if not np.isfinite(result).all():
-        raise ValueError('Nonfinite decoded training data')
-    return result
 
 
 def write_json(path, value):
@@ -76,17 +34,10 @@ def write_json(path, value):
 
 
 def restore_training_cache(json_path, npz_path=None):
-    """Regenerate the optional training cache from canonical JSON alone."""
-    path = Path(json_path)
-    record = json.loads(path.read_text(encoding='utf-8'))
-    arrays = {k: decode_array(v) for k, v in record['observations'].items()}
-    arrays['actions'] = np.asarray(record.get('expert_actions',record['actions']), dtype=np.float32)
-    arrays['executed_actions'] = np.asarray(record['executed_actions'], dtype=np.float32)
-    arrays['metadata'] = np.asarray(json.dumps(record['metadata']))
-    target = Path(npz_path) if npz_path else path.with_suffix('.npz')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(target, **arrays)
-    return target
+    """Convert a legacy JSON record, or copy a canonical NPZ episode."""
+    path=Path(json_path)
+    return write_episode(Path(npz_path) if npz_path else path.with_suffix('.npz'),
+                         load_episode(path))
 
 
 def write_replay_index(path,record):
@@ -122,9 +73,7 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     constrained=bool(getattr(actor,'execution_metadata',None))
     if constrained and (actor_name!='policy' or expert_labeler is not None):
         raise ValueError('An explicit policy constraint layer cannot enter expert or DAgger collection')
-    path = Path(output_dir) / f'{name}.json'
-    if record_observations:
-        path.with_suffix('.npz').unlink(missing_ok=True)
+    path = Path(output_dir) / f'{name}.npz'
     obs, info = env.reset(seed=int(seed), options={'scene': scene} if scene else None)
     actor.reset()
     if expert_labeler is not None: expert_labeler.reset()
@@ -159,10 +108,13 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     step_index = 0
     planning_failure = None
     unexpected_error = None
+    runtime_failure = None
     while not (terminated or truncated):
         if max_steps is not None and step_index >= max_steps:
             truncated=True
             break
+        stage='actor'
+        expert_control=False
         try:
             action = np.asarray(actor.act(obs), dtype=np.float32)
             if expert_labeler is not None:
@@ -171,25 +123,34 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
                 if expert_action.shape!=action_shape or not np.isfinite(expert_action).all():
                     raise ValueError('Expert label must be a finite direction')
                 if rng.random()<mixture_beta:
-                    action=expert_action.copy();expert_controls+=1
+                    action=expert_action.copy();expert_control=True
+            if action.shape != action_shape or not np.isfinite(action).all():
+                raise ValueError(f'{actor_name} returned an invalid action at step {step_index}')
+            if constrained:
+                raw_action=np.asarray(actor.last_raw_action,dtype=np.float32)
+                if raw_action.shape!=action_shape or not np.isfinite(raw_action).all():
+                    raise ValueError('Policy constraint layer did not retain a valid raw action')
+            stage='environment'
+            obs, _, terminated, truncated, info = env.step(action)
         except Exception as error:
-            planning_failure = {'type':type(error).__name__,'message':str(error),
-                                'step':step_index,'t':state['t']}
-            if constrained and getattr(actor,'last_raw_action',None) is not None:
-                planning_failure['raw_policy_action']=json_value(actor.last_raw_action)
+            failure = {'type':type(error).__name__,'message':str(error),
+                       'step':step_index,'t':state['t']}
+            if stage=='environment':
+                runtime_failure=dict(failure,attempted_action=action.tolist())
+            else:
+                planning_failure=failure
+                if constrained and getattr(actor,'last_raw_action',None) is not None:
+                    candidate=np.asarray(actor.last_raw_action)
+                    if candidate.dtype.kind in 'biuf' and np.isfinite(candidate).all():
+                        planning_failure['raw_policy_action']=json_value(candidate)
             terminated = True
-            if type(error).__name__ not in {'ExpertPlanningError','PlanningError','NoFeasibleAction'}:
+            if stage=='environment' or type(error).__name__ not in {'ExpertPlanningError','PlanningError','NoFeasibleAction'}:
                 unexpected_error = error
             break
-        if action.shape != action_shape or not np.isfinite(action).all():
-            raise ValueError(f'{actor_name} returned an invalid action at step {step_index}')
         if constrained:
-            raw_action=np.asarray(actor.last_raw_action,dtype=np.float32)
-            if raw_action.shape!=action_shape or not np.isfinite(raw_action).all():
-                raise ValueError('Policy constraint layer did not retain a valid raw action')
             raw_policy_actions.append(raw_action.tolist())
             constraint_interventions.append(bool(actor.last_intervened))
-        obs, _, terminated, truncated, info = env.step(action)
+        if expert_control:expert_controls+=1
         save_frame = (step_index + 1) % replay_every == 0 or terminated or truncated
         live_frame = server and (step_index + 1) % render_every == 0
         if save_frame or live_frame or not hasattr(env, 'uav_model'):
@@ -231,7 +192,8 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
                                 'coverage_ratio': c, 'distance': d})
         if realtime_factor:
             time.sleep(max(0., state['t'] / realtime_factor - (time.perf_counter() - start)))
-    if frame_action_indices[-1] != step_index:
+    if frame_action_indices[-1] != step_index or (runtime_failure is not None and
+            getattr(env,'t',frames[-1]['t'])!=frames[-1]['t']):
         frames.append(json_value(env.render()))
         frame_action_indices.append(step_index)
     summary = json_value(env.summary())
@@ -242,10 +204,12 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     if planning_failure:
         summary['planning_failure'] = planning_failure
         summary['termination_reason'] = 'policy_constraint_failure' if constrained else 'expert_planning_failure'
+    if runtime_failure:
+        summary.update(runtime_failure=runtime_failure,termination_reason='runtime_failure')
     behavior_failed=bool(terminated or (task=='tracking' and summary.get('first_loss_time') is not None))
     label_valid=step_index>0 and len(expert_actions)==len(actions)==step_index
     expert_valid=(label_valid and unexpected_error is None if expert_labeler is not None
-                  else actor_name=='expert' and not behavior_failed)
+                  else actor_name=='expert' and step_index>0 and not behavior_failed)
     metadata = {'scene_id': scene_id, 'scene_group_id':scene_group_id,
                 'expert_valid':expert_valid,
                 'task': task, 'seed': int(seed),
@@ -280,15 +244,10 @@ def run_episode(env, actor, *, seed, actor_name, output_dir, name,
     arrays = {k: np.stack(v) for k, v in sequences.items()}
     if record_observations:
         record['observations'] = {k: encode_array(v) for k, v in arrays.items()}
-    write_json(path, record)
+    # Every completed attempt remains replayable. Only accepted-manifest.json
+    # selects valid expert demonstrations for training.
+    path=write_episode(path,record)
     write_replay_index(path,record)
-    # Ordinary failed expert demonstrations are excluded; DAgger prefixes carry
-    # explicit validity/failure metadata and use expert labels, never behavior.
-    if record_observations and expert_valid:
-        arrays.update(actions=np.asarray(expert_actions if expert_labeler is not None else actions, dtype=np.float32),
-                      executed_actions=np.asarray(executed, dtype=np.float32),
-                      metadata=np.asarray(json.dumps(metadata)))
-        np.savez_compressed(path.with_suffix('.npz'), **arrays)
     print(f'[{task}/{actor_name}] saved {path} {json.dumps(summary, ensure_ascii=False)}', flush=True)
     if unexpected_error is not None:
         raise unexpected_error

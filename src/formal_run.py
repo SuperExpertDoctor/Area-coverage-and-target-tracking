@@ -1,14 +1,12 @@
 """Auditable fresh collection, independent training and latest-weight recording."""
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import io
 import json
 import math
-import multiprocessing
 from pathlib import Path
 import threading
 import time
@@ -44,15 +42,15 @@ def task_success(task, summary, seconds):
             and (task != 'tracking' or summary.get('first_loss_time') is None))
 
 
-def freeze_latest(task, model_dir, frozen_dir):
+def freeze_checkpoint(task, source, frozen_dir):
     import torch
-    source = Path(model_dir)/'last.pt'
+    source = Path(source)
     payload = source.read_bytes()
     state = torch.load(io.BytesIO(payload), map_location='cpu', weights_only=False)
     if state.get('task') != task:
         raise ValueError('Latest checkpoint task mismatch')
     sha = hashlib.sha256(payload).hexdigest()
-    target = Path(frozen_dir)/f'{task}-last-{sha}.pt'
+    target = Path(frozen_dir)/f'{task}-{sha}.pt'
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and target.read_bytes() != payload:
         raise ValueError('Frozen checkpoint bytes changed')
@@ -60,8 +58,25 @@ def freeze_latest(task, model_dir, frozen_dir):
         temporary=target.with_suffix('.pt.tmp')
         temporary.write_bytes(payload)
         temporary.replace(target)
+    split=state.get('dataset_split') or {}
+    groups=set()
+    seeds=set()
+    for subset in ('train','validation'):
+        groups.update(str(group) for group in split.get(
+            subset+'_scene_group_ids',split.get(subset+'_scene_ids',[])) if group is not None)
+        groups.update(str(group) for group in split.get('fixed_scene_groups',{}).get(subset,[])
+                      if group is not None)
+    for episode in split.get('episodes',[]):
+        group=episode.get('scene_group_id',episode.get('scene_id'))
+        if group is not None:groups.add(str(group))
+        seed=episode.get('seed')
+        if isinstance(seed,int) and not isinstance(seed,bool):seeds.add(seed)
     return dict(path=str(target.resolve()), source=str(source.resolve()), sha256=sha,
-                epoch=state['epoch'])
+                epoch=state['epoch'], excluded_scene_groups=sorted(groups),training_seeds=sorted(seeds))
+
+
+def freeze_latest(task, model_dir, frozen_dir):
+    return freeze_checkpoint(task, Path(model_dir)/'last.pt', frozen_dir)
 
 
 def formal_protocol(args, config, tasks):
@@ -87,7 +102,7 @@ def formal_protocol(args, config, tasks):
         validation_fraction=args.validation_fraction, latest_checkpoint_name='last.pt',
         test_outcomes_used_for_weight_selection=False,
         split_unit='scene_group_id', simulation=asdict(config),
-        training={key: getattr(args, key) for key in ('epochs','batch_size','sequence_length',
+        training={key: getattr(args, key) for key in ('epochs','batch_size','validation_batch_size','sequence_length',
             'learning_rate','weight_decay','grad_clip','training_seed','hidden_size',
             'correction_weight_max','field_steering_loss_weight','normalize_vectors',
             'normalization_min_std','field_cloud_geometry_encoder','field_frame',
@@ -96,8 +111,7 @@ def formal_protocol(args, config, tasks):
         collection_seed=args.collection_seed, expert_seed=args.expert_seed,
         recording={key:getattr(args,key) for key in ('browser_recording','recording_fps',
             'recording_width','recording_height','recording_duration_seconds','recording_bitrate')},
-        tasks={task: dict(modes=(['none', 'forecast'] if task == 'coverage'
-                and args.formal_coverage_safety_layer == 'forecast' else ['none']),
+        tasks={task: dict(modes=([args.formal_coverage_safety_layer] if task == 'coverage' else ['none']),
             primary_mode=args.formal_coverage_safety_layer if task == 'coverage' else 'none',
             fresh_seeds=list(range(args.formal_test_seed + (10000 if task == 'tracking' else 0),
                                   args.formal_test_seed + (10000 if task == 'tracking' else 0)
@@ -110,7 +124,7 @@ def formal_protocol(args, config, tasks):
 
 class FormalStatus:
     def __init__(self, output_dir, run_name, tasks, server=None):
-        self.path = Path(output_dir)/'formal-status.json'
+        self.path = Path(output_dir)/'logs'/'formal-status.json'
         self.server = server
         self.lock = threading.RLock()
         self.value = dict(run_name=run_name, phase='preparing', task=None, status='running',
@@ -150,7 +164,7 @@ class ProgressMonitor:
         for task in self.tasks:
             try:
                 manifest = self.out/'datasets'/task/'accepted-manifest.json'
-                progress = self.out/'models'/task/'training-status.json'
+                progress = self.out/'logs'/'training'/task/'training-status.json'
                 if manifest.is_file():
                     value = json.loads(manifest.read_text(encoding='utf-8'))
                     self.status.task_update(task, 'collection', dict(
@@ -202,7 +216,7 @@ def _rollout(job, server=None):
     from env_coverage import CoverageEnv
     from env_tracking import TrackingEnv
     from expert_field import FieldCoverageExpert, FieldTrackingExpert
-    from rollouts import run_episode, write_json, write_replay_index
+    from rollouts import run_episode, write_episode, write_replay_index
     config = Config.from_dict(job['config'])
     task = job['task']
     env = (CoverageEnv if task == 'coverage' else TrackingEnv)(config, render_mode='json')
@@ -229,19 +243,20 @@ def _rollout(job, server=None):
             record['metadata'].update(model_sha256=job['checkpoint']['sha256'],
                 model_checkpoint=job['checkpoint']['source'],
                 control_mode=record['metadata'].get('control_mode', 'pure_network'))
-            write_json(path, record)
+            write_episode(path, record)
             write_replay_index(path, record)
         return dict(task=task, seed=job['seed'], mode=job.get('mode', 'expert'),
             path=str(path.resolve()), summary=record['summary'],
+            scene_group_id=record['metadata']['scene_group_id'],
             success=task_success(task, record['summary'], config.to_dict()[f'{task}_episode_seconds']))
     finally:
         env.close()
 
 
-def _test_rollout(job):
+def _test_rollout(job, server=None):
     """Keep failed independent cases without erasing other task outcomes."""
     try:
-        return _rollout(job)
+        return _rollout(job, server) if server is not None else _rollout(job)
     except Exception as error:
         path=Path(job['output_dir'])/(job['name']+'.failure.json')
         result=dict(task=job['task'],seed=job['seed'],mode=job['mode'],path=str(path.resolve()),
@@ -267,15 +282,13 @@ def run_formal(args, config, tasks, server, command):
     if not args.collection_require_task_success:
         raise ValueError('Formal expert collection requires complete task success')
     protocol = formal_protocol(args, config, tasks)
-    protocol_path = out/'formal-protocol.json'
+    protocol_path = out/'logs'/'formal-protocol.json'
     if protocol_path.exists():
-        previous = json.loads(protocol_path.read_text(encoding='utf-8'))
-        if not args.formal_resume or previous != protocol:
-            raise ValueError('Formal protocol already exists or changed; use a fresh output directory')
+        raise FileExistsError('Formal protocol already exists; choose a new --experiment-name')
     atomic_json(protocol_path, protocol)
     status = FormalStatus(out, args.run_name, tasks, server)
     report = dict(protocol=protocol, tasks={}, complete=False)
-    report_path = out/'formal-report.json'
+    report_path = out/'logs'/'formal-report.json'
     configs = {task: replace(config, **{f'{task}_episode_seconds':
         protocol['tasks'][task]['duration_seconds']}) for task in tasks}
     try:
@@ -283,7 +296,7 @@ def run_formal(args, config, tasks, server, command):
             for task in tasks:
                 status.update(phase='expert_preflight', task=task)
                 job = dict(task=task, config=asdict(configs[task]), actor='expert',
-                    seed=args.expert_seed+(task == 'tracking'), output_dir=str(out/'preflight'),
+                    seed=args.expert_seed+(task == 'tracking'), output_dir=str(out/'datasets'/'preflight'),
                     name=f'{task}-expert', replay_every=args.collection_replay_every,
                     progress_every=args.progress_every)
                 preflight = _rollout(job, server)
@@ -297,7 +310,7 @@ def run_formal(args, config, tasks, server, command):
                     episodes=args.episodes, seed=args.collection_seed+(10000 if task == 'tracking' else 0),
                     workers=args.collection_workers, attempt_multiplier=args.collection_attempt_multiplier,
                     replay_every=args.collection_replay_every, progress_every=args.progress_every,
-                    server=server, resume=args.collection_resume,
+                    server=server, resume=False,
                     require_task_success=args.collection_require_task_success)
                 report['tasks'][task]['collection'] = {key: collection[key] for key in
                     ('manifest_path', 'complete', 'metrics', 'identity_hash')}
@@ -305,11 +318,11 @@ def run_formal(args, config, tasks, server, command):
                 monitor.poll()
             for task in tasks:
                 status.update(phase='training', task=task)
-                model_dir = out/'models'/task
-                latest = model_dir/'last.pt'
+                model_dir = out/'weights'/task
                 training = train_policy(task, out/'datasets'/task/'accepted-manifest.json',
                     model_dir, Path(args.tf_log_dir)/task/args.run_name,
-                    epochs=args.epochs, batch_size=args.batch_size, sequence_length=args.sequence_length,
+                    epochs=args.epochs, batch_size=args.batch_size, validation_batch_size=args.validation_batch_size,
+                    sequence_length=args.sequence_length, log_dir=out/'logs'/'training'/task,
                     learning_rate=args.learning_rate, weight_decay=args.weight_decay, grad_clip=args.grad_clip,
                     validation_fraction=args.validation_fraction, seed=args.training_seed,
                     hidden_size=args.hidden_size, device=args.device, num_threads=args.num_threads,
@@ -321,38 +334,39 @@ def run_formal(args, config, tasks, server, command):
                     metadata={'simulation_config': asdict(configs[task]), 'command': command,
                               'formal_source_sha256':protocol['source_sha256']},
                     progress_every=args.training_progress_every, progress_seconds=args.training_progress_seconds,
-                    load_workers=args.training_load_workers,
-                    resume_checkpoint=latest if args.formal_resume and latest.exists() else None)
+                    load_workers=args.training_load_workers)
                 report['tasks'][task]['training'] = training
-                report['tasks'][task]['latest'] = freeze_latest(task, model_dir, out/'frozen-latest')
+                report['tasks'][task]['latest'] = freeze_latest(task, model_dir, out/'weights'/'frozen-latest')
                 atomic_json(report_path, report)
-            jobs = []
+            from .evaluation import evaluate_policy
+            status.update(phase='closed_loop_tests', task=None)
             for task in tasks:
                 manifest=json.loads((out/'datasets'/task/'accepted-manifest.json').read_text(encoding='utf-8'))
                 from .datasets import read_episode_metadata
-                excluded_groups=list({read_episode_metadata(path).get('scene_group_id') for path in manifest['paths']})
+                excluded_groups=list(report['tasks'][task]['latest'].get('excluded_scene_groups',[]))
+                for entry in manifest['paths']:
+                    path=Path(entry)
+                    if not path.is_absolute():path=out/'datasets'/task/path
+                    group=read_episode_metadata(path).get('scene_group_id')
+                    if group:excluded_groups.append(group)
                 for mode in protocol['tasks'][task]['modes']:
-                    for seed in protocol['tasks'][task]['fresh_seeds']:
-                        jobs.append(dict(task=task, config=asdict(configs[task]), actor='policy',
-                            seed=seed, mode=mode, checkpoint=report['tasks'][task]['latest'],
-                            inference_device=args.inference_device,inference_num_threads=args.inference_num_threads,
-                            output_dir=str(out/'closed-loop-tests'/task/mode), name=f'policy-{seed}',
-                            excluded_scene_groups=excluded_groups,
-                            replay_every=args.formal_test_replay_every, progress_every=args.progress_every))
-            status.update(phase='closed_loop_tests', task=None)
-            with ProcessPoolExecutor(max_workers=args.formal_test_workers,
-                    mp_context=multiprocessing.get_context('spawn')) as executor:
-                for result in executor.map(_test_rollout, jobs):
-                    report['tasks'][result['task']].setdefault('tests', []).append(result)
+                    seeds=protocol['tasks'][task]['fresh_seeds']
+                    evaluation=evaluate_policy(task,configs[task],report['tasks'][task]['latest'],
+                        out/'eval'/task/mode,episodes=len(seeds),seed=seeds[0],
+                        workers=args.formal_test_workers,mode=mode,excluded_scene_groups=excluded_groups,
+                        replay_every=args.formal_test_replay_every,progress_every=args.progress_every,
+                        inference_device=args.inference_device,inference_num_threads=args.inference_num_threads)
+                    report['tasks'][task].setdefault('evaluations',{})[mode]=evaluation
+                    report['tasks'][task].setdefault('tests',[]).extend(evaluation['episodes'])
                     atomic_json(report_path, report)
-                    print('[formal-test] '+json.dumps(result, ensure_ascii=False), flush=True)
             for task in tasks:
                 mode = args.formal_coverage_safety_layer if task == 'coverage' else 'none'
                 status.update(phase='latest_policy_demo', task=task)
-                expert = json.loads(Path(report['tasks'][task]['expert']['path']).read_text(encoding='utf-8'))
+                from rollouts import load_replay
+                expert = load_replay(report['tasks'][task]['expert']['path'])
                 demo = _rollout(dict(task=task, config=asdict(configs[task]), actor='policy',
                     seed=expert['seed'], scene=expert['scene'], mode=mode,
-                    checkpoint=report['tasks'][task]['latest'], output_dir=str(out/'replays'),
+                    checkpoint=report['tasks'][task]['latest'], output_dir=str(out/'eval'/'demos'/task),
                     inference_device=args.inference_device,inference_num_threads=args.inference_num_threads,
                     name=f'{task}-latest-policy', replay_every=1,
                     progress_every=args.progress_every), server)

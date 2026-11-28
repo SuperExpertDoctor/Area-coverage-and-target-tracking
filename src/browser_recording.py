@@ -20,6 +20,11 @@ import uuid
 
 import imageio_ffmpeg
 
+try:
+    from .episode_io import load_replay
+except ImportError:
+    from episode_io import load_replay
+
 
 RECORDING_DEFAULTS = {
     'recording_fps': 24, 'recording_width': 1440, 'recording_height': 900,
@@ -100,7 +105,7 @@ def transcode_recording(source, directory, config, provenance):
             raise ValueError('Converted MP4 exceeds recording_max_bytes')
         temporary.replace(final)
         record = dict(details, path=str(final.resolve()), metadata_path=str(metadata_path.resolve()),
-                      url='/outputs/recordings/' + final.name, provenance=provenance,
+                      url='/outputs/logs/recordings/' + final.name, provenance=provenance,
                       created_at=datetime.now(timezone.utc).isoformat())
         metadata_path.write_text(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
         return record
@@ -173,7 +178,7 @@ def record_policy_replay(server_url, replay_path, output_dir, *, fps, width, hei
     """Record a genuine policy replay through the visible UI facility.
 
     ``output_dir`` must be the serving VisualServer's outputs root. The replay
-    must be inside it; the returned MP4 is under ``output_dir/recordings``.
+    must be inside it; the returned MP4 is under ``output_dir/logs/recordings``.
     Parameters must match ``VisualServer(recording_config=...)`` so automated
     capture cannot silently diverge from the UI's exposed settings. Install
     Playwright with ``npm install playwright`` if no portable/cached runtime is
@@ -186,7 +191,7 @@ def record_policy_replay(server_url, replay_path, output_dir, *, fps, width, hei
     if urlsplit(server_url).scheme not in ('http', 'https'):
         raise ValueError('server_url must be an HTTP URL')
     replay_bytes = replay_path.read_bytes()
-    replay = json.loads(replay_bytes)
+    replay = load_replay(replay_path)
     if replay.get('actor') not in ('policy', 'network'):
         raise ValueError('Automatic latest-policy recording requires a policy replay; expert substitution is forbidden')
     if ((replay.get('metadata') or {}).get('behavior') == 'dagger_training'
@@ -219,7 +224,9 @@ def record_policy_replay(server_url, replay_path, output_dir, *, fps, width, hei
         replay_url='/outputs/' + quote(replay_path.relative_to(output_dir).as_posix(), safe='/'),
         fps=fps, width=width, height=height, duration_seconds=duration_seconds,
         headless=bool(headless), provenance=provenance)
-    cache = output_dir / 'cache'
+    cache = output_dir / 'logs' / 'cache'
+    if cache.resolve()!=cache or cache.is_symlink():
+        raise ValueError('Unsafe recording cache directory')
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='browser-recording-', dir=cache) as temporary:
         job_path = Path(temporary) / 'job.json'
@@ -234,8 +241,8 @@ def record_policy_replay(server_url, replay_path, output_dir, *, fps, width, hei
     except ValueError as error:
         raise RuntimeError(f'Frontend recording returned invalid metadata: {process.stdout[-1000:]}') from error
     path = Path(record['path']).resolve()
-    if path.parent != output_dir / 'recordings':
-        raise RuntimeError('Frontend recording returned a path outside outputs/recordings')
+    if path.parent != output_dir / 'logs' / 'recordings':
+        raise RuntimeError('Frontend recording returned a path outside logs/recordings')
     decoded = inspect_mp4(path)
     if decoded['width'] != width or decoded['height'] != height or abs(decoded['fps'] - fps) > .01:
         raise RuntimeError('Decoded MP4 dimensions/fps disagree with requested recording settings')

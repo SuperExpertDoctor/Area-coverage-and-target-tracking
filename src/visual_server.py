@@ -1,13 +1,14 @@
 """Local static server, bounded recording uploads and SSE broadcast.
 
 The simulation owns all numerical state. This module only transports published
-scene/frame dictionaries and serves recorded JSON replays and frontend assets.
+scene/frame dictionaries and serves JSON views of recorded NPZ and legacy JSON replays and frontend assets.
 It uses the Python standard library and is safe to leave running during training.
 """
 from __future__ import annotations
 
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import json
 import mimetypes
 import os
@@ -21,8 +22,10 @@ from urllib.parse import quote, unquote, urlsplit
 
 try:
     from .browser_recording import recording_configuration, transcode_recording
+    from .episode_io import load_replay, load_replay_bytes
 except ImportError:  # main.py also supports the existing top-level src imports.
     from browser_recording import recording_configuration, transcode_recording
+    from episode_io import load_replay, load_replay_bytes
 
 
 class _ExclusiveHTTPServer(ThreadingHTTPServer):
@@ -60,6 +63,7 @@ class VisualServer:
                               if key.startswith('visual_')}
         self.recording_config = recording_configuration(recording_config)
         self._recording_slot = threading.BoundedSemaphore(1)
+        self._replay_import_slot = threading.BoundedSemaphore(1)
         self._lock = threading.RLock()
         self._clients = set()
         self._scene = None
@@ -86,13 +90,15 @@ class VisualServer:
             def log_message(self, *_):
                 pass
 
-            def _headers(self, status, content_type, length=None):
+            def _headers(self, status, content_type, length=None, replay_sha256=None):
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Cache-Control", "no-cache")
                 if length is not None:
                     self.send_header("Content-Length", str(length))
+                if replay_sha256:
+                    self.send_header("X-Replay-SHA256", replay_sha256)
                 self.end_headers()
 
             def do_GET(self):
@@ -107,6 +113,9 @@ class VisualServer:
                 self.wfile.write(data)
 
             def do_POST(self):
+                if urlsplit(self.path).path == '/api/replays/convert':
+                    self._convert_replay()
+                    return
                 if urlsplit(self.path).path != '/api/recordings':
                     self.close_connection = True
                     self._json(405, {'error': 'Only POST /api/recordings is supported'})
@@ -143,8 +152,8 @@ class VisualServer:
                         duration = float(metadata['duration_seconds'])
                         if not 0 < duration <= service.recording_config['recording_max_seconds']:
                             raise ValueError('Recording duration exceeds recording_max_seconds')
-                    directory = service.output_dir / 'recordings'
-                    if directory.resolve().parent != service.output_dir or directory.is_symlink():
+                    directory = service.output_dir / 'logs' / 'recordings'
+                    if directory.resolve() != service.output_dir / 'logs' / 'recordings' or directory.is_symlink():
                         raise ValueError('Unsafe recordings directory')
                 except (ValueError, TypeError) as error:
                     self.close_connection = True
@@ -175,6 +184,46 @@ class VisualServer:
                 finally:
                     service._recording_slot.release()
 
+            def _convert_replay(self):
+                # Conversion is memory-only, same-origin and bounded both before
+                # upload and before compressed NPZ entries are expanded.
+                origin=self.headers.get('Origin')
+                if origin and urlsplit(origin).netloc!=self.headers.get('Host'):
+                    self.close_connection=True
+                    self._json(403,{'error':'Replay imports must be same-origin'})
+                    return
+                if not service._replay_import_slot.acquire(blocking=False):
+                    self.close_connection=True
+                    self._json(429,{'error':'A replay conversion is already in progress'})
+                    return
+                try:
+                    if self.headers.get('Transfer-Encoding'):
+                        raise ValueError('Content-Length is required')
+                    length=int(self.headers.get('Content-Length','0'))
+                    if length<=0: raise ValueError('Replay upload is empty')
+                    if length>128*1024*1024:
+                        self.close_connection=True
+                        self._json(413,{'error':'Replay exceeds the 128 MiB import limit'})
+                        return
+                    if self.headers.get('Content-Type','').split(';')[0].strip().lower() not in (
+                            'application/octet-stream','application/zip','application/x-npz'):
+                        raise ValueError('Upload an NPZ archive')
+                    self.connection.settimeout(30)
+                    payload=self.rfile.read(length)
+                    if len(payload)!=length: raise ValueError('Replay upload ended early')
+                    replay=load_replay_bytes(payload)
+                    if not isinstance(replay.get('frames'),list) or 'scene' not in replay:
+                        raise ValueError('Archive does not contain a replay')
+                    data=json.dumps(replay,ensure_ascii=False,allow_nan=False).encode('utf-8')
+                    self._headers(200,'application/json; charset=utf-8',len(data),
+                                  hashlib.sha256(payload).hexdigest())
+                    self.wfile.write(data)
+                except (OSError,ValueError,TypeError,KeyError) as error:
+                    self.close_connection=True
+                    self._json(400,{'error':str(error)})
+                finally:
+                    service._replay_import_slot.release()
+
             def _serve(self, head):
                 path = unquote(urlsplit(self.path).path)
                 if path == "/events" and not head:
@@ -187,14 +236,16 @@ class VisualServer:
                     return
                 if path == '/api/recording-config':
                     config = dict(service.recording_config,
-                                  output_directory=str(service.output_dir / 'recordings'))
+                                  output_directory=str(service.output_dir / 'logs' / 'recordings'))
                     data = json.dumps(config, ensure_ascii=False, allow_nan=False).encode('utf-8')
                     self._headers(200, 'application/json; charset=utf-8', len(data))
                     if not head:self.wfile.write(data)
                     return
                 if path == '/api/run-status':
                     try:
-                        status_file = service.output_dir / 'formal-status.json'
+                        status_file = service.output_dir / 'logs' / 'formal-status.json'
+                        if not status_file.is_file():
+                            status_file = service.output_dir / 'formal-status.json'
                         run_status = json.loads(status_file.read_text(encoding='utf-8')) if status_file.is_file() else {}
                     except (OSError, ValueError):
                         run_status = {}
@@ -211,6 +262,19 @@ class VisualServer:
                 file = service._static_path(path)
                 if file is None or not file.is_file():
                     self.send_error(404)
+                    return
+                if file.suffix.lower()=='.npz':
+                    try:
+                        replay=load_replay(file)
+                        if not isinstance(replay.get('frames'),list) or 'scene' not in replay:
+                            raise ValueError('NPZ does not contain a replay')
+                        data=json.dumps(replay,ensure_ascii=False,allow_nan=False).encode('utf-8')
+                        with file.open('rb') as stream:
+                            checksum=hashlib.sha256()
+                            for chunk in iter(lambda:stream.read(1024*1024),b''): checksum.update(chunk)
+                        self._headers(200,'application/json; charset=utf-8',len(data),checksum.hexdigest())
+                        if not head:self.wfile.write(data)
+                    except (OSError,ValueError,KeyError,TypeError):self.send_error(422,'Invalid NPZ replay')
                     return
                 try:
                     with file.open("rb") as stream:
@@ -287,10 +351,7 @@ class VisualServer:
                     modified=stat.st_mtime,bytes=stat.st_size)
 
     def _read_replay_metadata(self,file,stat):
-        with file.open('r',encoding='utf-8') as stream:
-            # Large files are parsed only by the serialized background scanner.
-            # JSON object field order is immaterial, including for old replays.
-            replay=json.load(stream)
+        replay=load_replay(file)
         if not isinstance(replay,dict) or not isinstance(replay.get('frames'),list) or 'scene' not in replay:return None
         frames=replay['frames'];metadata=replay.get('metadata') or {}
         entry={'task':replay.get('task','coverage'),'actor':replay.get('actor','expert'),
@@ -314,7 +375,7 @@ class VisualServer:
         for directory,directories,files in os.walk(self.output_dir,followlinks=False):
             directories[:]=[name for name in directories if not name.startswith('.') and name.lower() not in ignored]
             for name in files:
-                if not name.lower().endswith('.json') or name.endswith('.replay-index.json'):continue
+                if not name.lower().endswith(('.json','.npz')) or name.endswith('.replay-index.json'):continue
                 file=Path(directory)/name
                 try:
                     if file.resolve().is_relative_to(self.output_dir):candidates.append((file,file.stat()))

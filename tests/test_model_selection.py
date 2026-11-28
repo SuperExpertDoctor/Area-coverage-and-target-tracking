@@ -47,6 +47,9 @@ def test_selection_uses_validation_only_and_preserves_offline_best(tmp_path,monk
     assert result['accepted']
     assert result['selected_candidate']=='last'
     assert all(job['episode_path']==paths[1] for job in calls)
+    assert all(Path(job['output']).suffix=='.npz' for job in calls)
+    assert all(Path(job['checkpoint']).parent==model_dir/'selection-snapshots' for job in calls)
+    assert not (model_dir/'selection.json').exists()
     assert {round(job['pan_offset'],6) for job in calls}=={round(-np.pi/9,6),0.,round(np.pi/9,6)}
     assert (model_dir/'best.pt').read_bytes()==original
     assert (model_dir/'selected.pt').read_bytes()==(model_dir/'last.pt').read_bytes()
@@ -80,3 +83,29 @@ def test_tracking_validation_pan_stress_changes_only_feasible_pan():
     assert stressed['radar_pan_initial']!=scene['radar_pan_initial']
     assert {k:v for k,v in stressed.items() if k!='radar_pan_initial'}=={k:v for k,v in original.items() if k!='radar_pan_initial'}
     assert details['requested_offset_radians']==np.pi/9
+
+
+def test_validation_worker_replays_npz_source_and_writes_only_npz(tmp_path):
+    from src.model_selection import _evaluate_candidate
+    from config import Config
+    from env_tracking import TrackingEnv
+    from expert_field import FieldTrackingExpert
+    from rollouts import run_episode, load_replay
+    from src.train import create_policy
+    cfg=Config(potential_enabled=True,tracking_episode_seconds=2.)
+    record,source=run_episode(TrackingEnv(cfg),FieldTrackingExpert(cfg),seed=22000,
+        actor_name='expert',output_dir=tmp_path/'datasets',name='source',
+        record_observations=True,max_steps=1)
+    model=create_policy('tracking',{'potential_field':True,'field_frame':'body','pan_residual':True})
+    checkpoint=tmp_path/'candidate.pt'
+    torch.save(dict(checkpoint_version='bc-field-v2',task='tracking',observation_schema='obs-field-v2',
+        action_schema='action-field-v2',model_config=model.model_config,model_state_dict=model.state_dict()),checkpoint)
+    target=tmp_path/'eval'/'candidate.npz'
+    result=_evaluate_candidate({'task':'tracking','checkpoint':str(checkpoint),'episode_path':str(source),
+        'scene_group_id':record['metadata']['scene_group_id'],'duration':2.,'pan_offset':0.,
+        'num_threads':1,'render_every':1,'output':str(target)})
+    assert result['path']==str(target.resolve()) and target.is_file()
+    assert not target.with_suffix('.json').exists() and not source.with_suffix('.json').exists()
+    replay=load_replay(target)
+    assert replay['summary']['steps']==2 and len(replay['actions'])==2
+    assert replay['metadata']['selection_subset']=='validation'

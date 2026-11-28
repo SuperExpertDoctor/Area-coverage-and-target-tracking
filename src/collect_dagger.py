@@ -11,7 +11,7 @@ from env_tracking import TrackingEnv
 from expert_coverage import CoverageExpert
 from expert_tracking import TrackingExpert
 from src.policy_tracking import NeuralPolicy
-from rollouts import run_episode,write_json,write_replay_index,restore_training_cache
+from rollouts import run_episode,write_json,write_replay_index,write_episode,load_replay
 from geometry import wrap
 from scenario import validate_scene
 
@@ -69,7 +69,7 @@ def collect_dagger(task,checkpoint,manifest_path,output_dir,*,iteration=1,
     if not original.get('complete'):raise ValueError('Cannot augment an incomplete expert dataset')
     accepted=[];rejected=[]
     for index,path in enumerate(paths):
-        source=json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
+        source=load_replay(path)
         scene=source['scene'];cfg=Config.from_dict(scene['config_snapshot'])
         augmentation=None
         if initial_pan_jitter:
@@ -92,12 +92,8 @@ def collect_dagger(task,checkpoint,manifest_path,output_dir,*,iteration=1,
         finally:env.close()
         if augmentation is not None:
             record['metadata']['training_augmentation']={'initial_pan_jitter':augmentation}
-            write_json(target,record)
+            target=write_episode(target,record)
             write_replay_index(target,record)
-            if record['metadata']['expert_valid']:
-                # Canonical JSON and derived NPZ carry the same augmentation
-                # provenance; original teacher actions remain unchanged labels.
-                restore_training_cache(target)
         (accepted if record['metadata']['expert_valid'] else rejected).append(str(target.resolve()))
     merged=dict(original)
     original_paths=[]

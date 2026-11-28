@@ -1,11 +1,11 @@
 """Public rollout protocol must retain explicit radar commands and actual pan."""
-import json
 from dataclasses import dataclass
 import numpy as np
 import pytest
 from gymnasium import spaces
 
 from rollouts import run_episode, restore_training_cache
+from episode_io import load_episode
 
 
 def test_three_command_rollout_and_dagger_roundtrip(tmp_path):
@@ -49,7 +49,7 @@ def test_three_command_rollout_and_dagger_roundtrip(tmp_path):
     with np.load(cache) as data:
         np.testing.assert_array_equal(data['actions'], [[1.,0.,.5]])
         np.testing.assert_array_equal(data['executed_actions'], [[1.,0.,.125]])
-    saved = json.loads(path.read_text(encoding='utf-8'))
+    saved = load_episode(path)
     assert saved['expert_actions'] == saved['actions']
 
 
@@ -80,5 +80,5 @@ def test_cli_default_field_output_preserves_legacy_artifacts(tmp_path,monkeypatc
     monkeypatch.setattr(expert_validation,'run_validation',validate)
     main.main(['--mode','expert-validate','--task','tracking','--potential-field',
         '--tf-log-dir',str(tmp_path/'tf-logs'),'--no-visualize','--no-save-video'])
-    assert calls==[tmp_path/'outputs'/'field-v2'/'diagnostics'/'expert-randomized']
+    assert calls==[tmp_path/'outputs'/'field-v2'/'logs'/'diagnostics'/'expert-randomized']
     assert legacy.read_bytes()==b'preserve legacy checkpoint'

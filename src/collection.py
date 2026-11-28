@@ -17,11 +17,12 @@ import queue
 import time
 import traceback
 
-from rollouts import json_value, run_episode, write_json
+from rollouts import json_value, run_episode, write_json, load_episode, load_replay
+from episode_io import archive_fingerprint
 
 SCHEMA = 'maritime-expert-collection-v1'
 _EVENT_QUEUE = None
-_SOURCE_NAMES = ('collection.py', 'rollouts.py', 'config.py', 'dynamics.py',
+_SOURCE_NAMES = ('collection.py', 'rollouts.py', 'episode_io.py', 'config.py', 'dynamics.py',
     'geometry.py', 'navigation.py', 'scenario.py', 'observations.py',
     'env_base.py', 'env_coverage.py', 'env_tracking.py', 'expert_coverage.py',
     'expert_tracking.py', 'expert_field.py', 'potential_field.py')
@@ -126,7 +127,7 @@ def _failure(job, error, status, record=None):
                         'traceback': ''.join(traceback.format_exception(
                             type(error), error, error.__traceback__))[-12000:]}}
     if record is not None:
-        result.update(json=str((Path(job['output_dir']) / f"episode-{job['seed']}.json").resolve()),
+        result.update(npz=str((Path(job['output_dir']) / f"episode-{job['seed']}.npz").resolve()),
                       summary=record.get('summary', {}))
     failure_path = Path(job['output_dir']) / 'failures' / f"episode-{job['seed']}.json"
     write_json(failure_path, {'task': job['task'], 'seed': job['seed'],
@@ -134,8 +135,8 @@ def _failure(job, error, status, record=None):
                'error': result['error'], 'summary': result['summary']})
     result['failure_json'] = str(failure_path.resolve())
     result['artifacts'] = [_artifact(failure_path)]
-    if result['json']:
-        result['artifacts'].append(_artifact(result['json']))
+    if result['npz']:
+        result['artifacts'].append(_artifact(result['npz']))
     return result
 
 
@@ -145,6 +146,8 @@ def _collect_one(job):
     phase = 'initialization_failure'
     publisher = _QueuePublisher(job['attempt'], job['seed'])
     start = time.perf_counter()
+    path = Path(job['output_dir']) / f"episode-{job['seed']}.npz"
+    previous_archive = archive_fingerprint(path)
     try:
         if job.get('source_sha256') and _source_fingerprint() != job['source_sha256']:
             raise RuntimeError('Collection source identity changed after manifest creation')
@@ -178,21 +181,20 @@ def _collect_one(job):
             status = 'task_incomplete'
         cache = path.with_suffix('.npz')
         result = {'seed': job['seed'], 'attempt': job['attempt'], 'status': status,
-                  'json': str(path.resolve()), 'npz': str(cache.resolve()) if valid else None,
+                  'json': None, 'npz': str(cache.resolve()),
                   'summary': summary, 'scene_id': record['metadata']['scene_id'],
                   'scene_group_id': record['metadata']['scene_group_id'],
-                  'artifacts': [_artifact(path)] + ([_artifact(cache)] if valid else [])}
+                  'artifacts': [_artifact(path)]}
         if rejection:
             result['rejection_reason'] = rejection
         if summary.get('planning_failure'):
             result['error'] = summary['planning_failure']
     except Exception as error:
-        path = Path(job['output_dir']) / f"episode-{job['seed']}.json"
         record = None
         if env is not None and env.scene is not None:
             phase = 'worker_error'
-            if path.is_file():
-                record = json.loads(path.read_text(encoding='utf-8'))
+            if path.is_file() and archive_fingerprint(path)!=previous_archive:
+                record = load_replay(path)
         result = _failure(job, error, phase, record)
     finally:
         if env is not None:
@@ -241,7 +243,7 @@ def collect_expert_episodes(task, config, output_dir, *, episodes, seed, workers
             raise ValueError(f'Collection already exists; resume or choose a new output directory: {manifest_path}')
         if previous.get('identity_hash') != identity_hash:
             raise ValueError(f'Collection identity mismatch; use a new output directory: {manifest_path}')
-    elif any(out.glob('episode-*.json')) or (out / '.collection-attempts').exists():
+    elif any(out.glob('episode-*.npz')) or any(out.glob('episode-*.json')) or (out / '.collection-attempts').exists():
         raise ValueError('Collection identity manifest is missing; use a new output directory')
     max_attempts = episodes * attempt_multiplier
     results = {}

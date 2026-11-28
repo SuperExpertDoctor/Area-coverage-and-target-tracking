@@ -181,7 +181,9 @@ def test_real_process_collection_keeps_parent_scene_and_frames_together(tmp_path
             assert event['collection_seed'] == current_scene
     assert frame_count > 0
     for accepted in result['accepted']:
-        record = json.loads(Path(accepted['json']).read_text(encoding='utf-8'))
+        record = module.load_episode(accepted['npz'])
+        assert accepted['json'] is None
+        assert not Path(accepted['npz']).with_suffix('.json').exists()
         assert len(record['actions']) == 2
         assert record['frame_action_indices'] == [0, 1, 2]
         assert record['metadata']['expert_valid']
@@ -198,7 +200,7 @@ def test_safe_but_incomplete_coverage_retains_labels_and_explicit_rejection(tmp_
     rejected = manifest['rejected'][0]
     assert rejected['status'] == 'task_incomplete'
     assert rejected['rejection_reason'] == 'coverage_incomplete'
-    record = json.loads(Path(rejected['json']).read_text(encoding='utf-8'))
+    record = module.load_episode(rejected['npz'])
     assert record['metadata']['expert_valid'] is True
     assert Path(rejected['npz']).is_file()
     assert manifest['paths'] == []
@@ -235,10 +237,10 @@ def test_worker_distinguishes_planning_failure_from_unexpected_error(tmp_path, m
     monkeypatch.setattr(FieldCoverageExpert, 'act', fail)
     result = module._collect_one(_job(tmp_path))
     assert result['status'] == ('worker_error' if unexpected else 'planning_failure')
-    assert result['json'] is not None
+    assert result['json'] is None
     assert result['summary']['planning_failure']['type'] == ('RuntimeError' if unexpected else 'PlanningError')
-    assert result['npz'] is None
-    assert not (tmp_path / 'episode-40.npz').exists()
+    assert Path(result['npz'])==(tmp_path/'episode-40.npz').resolve()
+    assert module.load_episode(result['npz'])['metadata']['expert_valid'] is False
     assert Path(_job(tmp_path)['result_path']).is_file()
 
 

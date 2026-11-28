@@ -38,22 +38,22 @@ def test_recording_configuration_and_bounds(service):
         config = json.load(response)
     assert config['recording_width'] == 320
     assert config['recording_max_bytes'] == 1000000
-    assert Path(config['output_directory']) == service.output_dir / 'recordings'
-    assert not (service.output_dir / 'recordings').exists()
+    assert Path(config['output_directory']) == service.output_dir / 'logs' / 'recordings'
+    assert not (service.output_dir / 'logs' / 'recordings').exists()
     # The limit is checked before reading the body. Sending a large body while
     # the server closes early races Windows' unread-data connection reset.
     assert upload(service, b'', **{'Content-Length': '1000001'})[0] == 413
     assert upload(service, b'x', mime='text/plain')[0] == 415
     assert upload(service, b'x', Origin='https://unrelated.invalid')[0] == 403
     assert upload(service, b'x', metadata={'duration_seconds': 9})[0] == 400
-    assert not list((service.output_dir / 'recordings').glob('*.mp4'))
+    assert not list((service.output_dir / 'logs' / 'recordings').glob('*.mp4'))
 
 
 def test_corrupt_video_has_meaningful_error_and_no_fake_mp4(service):
     status, result = upload(service, b'not a real webm')
     assert status == 422
     assert 'video' in result['error'].lower() or 'ffmpeg' in result['error'].lower()
-    assert not list((service.output_dir / 'recordings').glob('*.mp4'))
+    assert not list((service.output_dir / 'logs' / 'recordings').glob('*.mp4'))
 
 
 def test_failed_ffmpeg_upload_returns_structured_error(service, monkeypatch):
@@ -70,7 +70,8 @@ def test_run_status_missing_then_persisted_then_published(service):
     service.output_dir.mkdir(exist_ok=True)
     status = {'phase': 'training', 'task': 'tracking', 'tasks': {
         'tracking': {'training': {'epoch': 7, 'epochs': 20, 'validation_loss': .4}}}}
-    (service.output_dir / 'formal-status.json').write_text(json.dumps(status), encoding='utf-8')
+    (service.output_dir / 'logs').mkdir(parents=True,exist_ok=True)
+    (service.output_dir / 'logs' / 'formal-status.json').write_text(json.dumps(status), encoding='utf-8')
     with urlopen(service.url + 'api/run-status') as response:
         assert json.load(response) == status
 
@@ -91,11 +92,14 @@ def test_real_browser_policy_capture_decodes_and_preserves_failure(service):
                     'metrics': {'distance': 2000}, 'radar': {'range': 3000, 'half_angle': .5}}
                    for t in (0, 600, 1200, 1800)],
         'summary': {'terminated': True, 'termination_reason': 'test_failure'}}
-    source = service.output_dir / 'tracking-latest.json'
-    source.write_text(json.dumps(replay), encoding='utf-8')
+    from episode_io import write_episode
+    source = write_episode(service.output_dir/'eval'/'tracking-latest.npz',replay)
     result = record_policy_replay(service.url, source, service.output_dir,
         fps=10, width=320, height=240, duration_seconds=1)
     assert result['provenance']['simulation_end_seconds'] == 1800
+    import hashlib
+    assert result['provenance']['replay_sha256']==hashlib.sha256(source.read_bytes()).hexdigest()
+    assert Path(result['path']).parent==service.output_dir/'logs'/'recordings'
     assert result['provenance']['recorded_simulation_end_seconds'] == 1800
     assert result['provenance']['outcome']['termination_reason'] == 'test_failure'
     assert result['provenance']['model_sha256'] == 'a' * 64
@@ -123,7 +127,7 @@ def test_webm_is_decoded_transcoded_and_paths_cannot_escape(service, tmp_path):
         'model_sha256': 'f' * 64, 'duration_seconds': 1})
     assert status == 201, result
     saved = Path(result['path'])
-    assert saved.resolve().parent == (service.output_dir / 'recordings').resolve()
+    assert saved.resolve().parent == (service.output_dir / 'logs' / 'recordings').resolve()
     assert saved.suffix == '.mp4' and saved.read_bytes()[4:8] == b'ftyp'
     assert result['container'] == 'mp4' and result['width'] == 320 and result['height'] == 240
     assert result['fps'] == 10 and .8 < result['duration_seconds'] < 1.2
@@ -137,7 +141,7 @@ def test_webm_is_decoded_transcoded_and_paths_cannot_escape(service, tmp_path):
 
 
 def test_recording_directory_symlink_is_rejected(service, tmp_path):
-    directory = service.output_dir / 'recordings'
+    directory = service.output_dir / 'logs' / 'recordings'
     directory.parent.mkdir(parents=True, exist_ok=True)
     target = tmp_path / 'elsewhere'
     target.mkdir()
@@ -147,3 +151,12 @@ def test_recording_directory_symlink_is_rejected(service, tmp_path):
         pytest.skip('Creating symlinks requires Windows developer mode')
     assert upload(service, b'invalid')[0] == 400
     assert list(target.iterdir()) == []
+
+
+def test_run_status_accepts_legacy_location_and_prefers_experiment_logs(service):
+    service.output_dir.mkdir(exist_ok=True)
+    (service.output_dir/'formal-status.json').write_text('{"phase":"legacy"}',encoding='utf-8')
+    with urlopen(service.url+'api/run-status') as response:assert json.load(response)['phase']=='legacy'
+    (service.output_dir/'logs').mkdir()
+    (service.output_dir/'logs'/'formal-status.json').write_text('{"phase":"current"}',encoding='utf-8')
+    with urlopen(service.url+'api/run-status') as response:assert json.load(response)['phase']=='current'

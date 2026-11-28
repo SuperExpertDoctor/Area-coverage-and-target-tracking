@@ -39,15 +39,16 @@ def test_formal_protocol_declares_fresh_seeds_and_modes_before_outcomes():
     from main import parser
     from config import Config
     from src.formal_run import formal_protocol
-    args=parser().parse_args(['--mode','formal','--episodes','1000','--validation-fraction','.2'])
+    args=parser().parse_args(['--mode','formal','--episodes','1000','--validation-fraction','.2',
+                             '--formal-coverage-safety-layer','forecast'])
     protocol=formal_protocol(args,Config(potential_enabled=True),['coverage','tracking'])
     assert protocol['episodes_per_task']==1000
     assert protocol['validation_fraction']==.2
     assert protocol['latest_checkpoint_name']=='last.pt'
-    assert protocol['tasks']['coverage']['modes']==['none','forecast']
+    assert protocol['tasks']['coverage']['modes']==['forecast']
     assert protocol['tasks']['tracking']['modes']==['none']
-    assert protocol['tasks']['coverage']['fresh_seeds']==list(range(940000,940008))
-    assert protocol['tasks']['tracking']['fresh_seeds']==list(range(950000,950008))
+    assert protocol['tasks']['coverage']['fresh_seeds']==list(range(940000,940030))
+    assert protocol['tasks']['tracking']['fresh_seeds']==list(range(950000,950030))
     assert protocol['test_outcomes_used_for_weight_selection'] is False
 
 
@@ -56,7 +57,7 @@ def test_formal_status_atomic_updates_keep_other_task_state(tmp_path):
     status=FormalStatus(tmp_path,'test',['coverage','tracking'])
     status.task_update('coverage','collection',{'accepted':12,'target':1000})
     status.task_update('tracking','training',{'epoch':2,'epochs':20,'validation_loss':.1})
-    value=json.loads((tmp_path/'formal-status.json').read_text(encoding='utf-8'))
+    value=json.loads((tmp_path/'logs'/'formal-status.json').read_text(encoding='utf-8'))
     assert value['tasks']['coverage']['collection']['accepted']==12
     assert value['tasks']['tracking']['training']['epoch']==2
     assert not list(tmp_path.glob('*.tmp'))
@@ -71,7 +72,7 @@ def test_formal_protocol_rejects_collection_and_test_overlap():
         formal_protocol(args,Config(potential_enabled=True),['coverage'])
 
 
-def test_formal_protocol_survives_json_roundtrip_for_real_resume():
+def test_formal_protocol_survives_json_roundtrip():
     from main import parser
     from config import Config
     from src.formal_run import formal_protocol
@@ -80,18 +81,18 @@ def test_formal_protocol_survives_json_roundtrip_for_real_resume():
     assert protocol==json.loads(json.dumps(protocol))
 
 
-def test_formal_resume_accepts_its_persisted_protocol_before_preflight(tmp_path,monkeypatch):
+def test_formal_rejects_an_existing_protocol_before_preflight(tmp_path,monkeypatch):
     from main import parser
     from config import Config
     from src import formal_run
     args=parser().parse_args(['--mode','formal','--run-name','resume-test'])
     args.output_dir=tmp_path
     cfg=Config(potential_enabled=True)
-    formal_run.atomic_json(tmp_path/'formal-protocol.json',formal_run.formal_protocol(args,cfg,['tracking']))
+    formal_run.atomic_json(tmp_path/'logs'/'formal-protocol.json',formal_run.formal_protocol(args,cfg,['tracking']))
     class ReachedPreflight(Exception):pass
     def stop(job,server):raise ReachedPreflight()
     monkeypatch.setattr(formal_run,'_rollout',stop)
-    with pytest.raises(ReachedPreflight):
+    with pytest.raises(FileExistsError,match='already exists'):
         formal_run.run_formal(args,cfg,['tracking'],None,{})
 
 

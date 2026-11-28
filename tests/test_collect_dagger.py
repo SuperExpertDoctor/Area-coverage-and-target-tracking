@@ -52,7 +52,7 @@ def test_dagger_pan_jitter_keeps_layout_split_and_json_npz_teacher_provenance(tm
     from config import Config
     from env_tracking import TrackingEnv
     from expert_field import FieldTrackingExpert
-    from rollouts import run_episode
+    from rollouts import run_episode, load_episode
     from src.train import create_policy
     from src.datasets import read_episode_metadata, SequenceDataset
     collector = importlib.import_module('collect_dagger')
@@ -74,7 +74,9 @@ def test_dagger_pan_jitter_keeps_layout_split_and_json_npz_teacher_provenance(tm
     target, report = collector.collect_dagger('tracking', checkpoint, manifest, tmp_path / 'augmented',
         episodes=1, beta=0, max_steps=1, initial_pan_jitter=math.radians(20), seed=99)
     assert len(report['accepted']) == 1 and source.read_bytes() == source_bytes
-    record = json.loads(Path(report['accepted'][0]).read_text(encoding='utf-8'))
+    record = load_episode(report['accepted'][0])
+    assert Path(report['accepted'][0]).suffix=='.npz'
+    assert not Path(report['accepted'][0]).with_suffix('.json').exists()
     metadata = read_episode_metadata(Path(report['accepted'][0]).with_suffix('.npz'))
     assert metadata['training_augmentation'] == record['metadata']['training_augmentation']
     assert metadata['scene_group_id'] == original['metadata']['scene_group_id']

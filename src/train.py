@@ -7,7 +7,8 @@ num_threads=1, model_config=None, metadata=None, normalize_vectors=True,
 normalization_min_std=.1, initial_checkpoint=None,
 correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
 split_reference_checkpoint=None, field_steering_loss_weight=0., progress_every=50,
-progress_seconds=30., load_workers=0, resume_checkpoint=None)``
+progress_seconds=30., load_workers=0, resume_checkpoint=None,
+validation_batch_size=None, log_dir=None)``
 
 An episode begins with zero hidden state. Its contiguous TBPTT chunks carry
 ``hidden.detach()``. Episodes, never individual fragments, are shuffled. Loss is
@@ -166,8 +167,14 @@ def _field_steering_loss(predicted, target, vector):
 def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=None,
                grad_clip=1., order=None, correction_weight_max=1., correction_threshold=.1,
                field_steering_loss_weight=0., load_workers=0, progress_callback=None,
-               progress_every=50, progress_seconds=30.):
-    """Encode map chunks only, carrying causal state across contiguous chunks."""
+               progress_every=50, progress_seconds=30., batch_callback=None):
+    """Encode map chunks only, carrying causal state across contiguous chunks.
+
+    A completed mini-batch is one parallel group of contiguous sequence chunks,
+    including its final short chunk. The callback runs after the optimizer step
+    or no-grad validation pass, with local metrics and unpadded action-step and
+    active-sequence counts. It never changes the recurrent state or sampling.
+    """
     training = optimizer is not None
     if not math.isfinite(field_steering_loss_weight) or field_steering_loss_weight<0:
         raise ValueError("invalid field_steering_loss_weight")
@@ -261,13 +268,23 @@ def _run_epoch(model, dataset, batch_size, sequence_length, device, optimizer=No
                     gradient_norm = float(norm.detach().item())
                     optimizer.step()
             hidden = hidden.detach()
-            squared_sum += float(square.detach().item())
-            absolute_sum += float((error.detach().abs() * mask).sum().item())
-            objective_sum += float(objective.detach().item())
-            objective_weight_sum += float(weight_count.detach().item() if torch.is_tensor(weight_count) else weight_count)
+            batch_squared = float(square.detach().item())
+            batch_absolute = float((error.detach().abs() * mask).sum().item())
+            batch_objective = float(objective.detach().item())
+            batch_weight = float(weight_count.detach().item() if torch.is_tensor(weight_count) else weight_count)
+            squared_sum += batch_squared
+            absolute_sum += batch_absolute
+            objective_sum += batch_objective
+            objective_weight_sum += batch_weight
             valid_steps += step_count
             valid_components += step_count * error.shape[-1]
             chunks_processed += 1
+            if batch_callback is not None:
+                batch_callback(dict(loss=batch_objective / batch_weight,
+                                    action_mse=batch_squared / (step_count * error.shape[-1]),
+                                    action_mae=batch_absolute / (step_count * error.shape[-1]),
+                                    steps=step_count,
+                                    sequences=sum(len(chunk['actions']) > 0 for chunk in chunks)))
             if (chunks_processed % progress_every == 0 or
                     time.perf_counter() - last_progress >= progress_seconds or
                     (offset + batch_size >= len(indices) and start + sequence_length >= maximum)):
@@ -313,6 +330,27 @@ def _atomic_torch_save(path, value):
 def _write_json(path, value):
     encoded = json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False).encode("utf-8")
     _atomic_write(path, lambda stream: stream.write(encoded))
+
+
+def _wait_for_tensorboard_resume(tf_log_dir):
+    """Open resumed event streams in a later filename second than prior files.
+
+    TensorBoard sorts filenames lexically. Its unpadded process/UID suffix can
+    put a new .10 file before .7 in the same second, reversing purge order.
+    The ordinary wait is at most one second and does not touch training RNGs.
+    """
+    directories = [tf_log_dir, tf_log_dir / "batches" / "train", tf_log_dir / "batches" / "validation"]
+    timestamps = [int(path.name.split(".")[3]) for directory in directories
+                  for path in directory.glob("events.out.tfevents.*")
+                  if path.name.split(".")[3].isdigit()]
+    if not timestamps:
+        return
+    latest = max(timestamps)
+    now = time.time()
+    if latest > int(now):
+        raise ValueError("TensorBoard resume event timestamps are ahead of the current clock")
+    if latest == int(now):
+        time.sleep(latest + 1 - now)
 
 
 def _capture_rng_state(shuffle_rng):
@@ -442,7 +480,7 @@ def _record_training_failure(function):
         try:
             return function(task, dataset_dir, output_dir, tf_log_dir, **kwargs)
         except Exception as error:
-            path = Path(output_dir) / "training-status.json"
+            path = Path(output_dir if kwargs.get("log_dir") is None else kwargs["log_dir"]) / "training-status.json"
             if path.is_file():
                 try:
                     status = json.loads(path.read_text(encoding="utf-8"))
@@ -464,8 +502,9 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                  normalize_vectors=True, normalization_min_std=.1, initial_checkpoint=None,
                  correction_weight_max=1., correction_threshold=.1, dagger_recovery_min_steps=0,
                  split_reference_checkpoint=None, field_steering_loss_weight=0.,
-                 progress_every=50, progress_seconds=30., load_workers=0, resume_checkpoint=None):
-    """Train one task, write six meaningful TensorBoard metrics and best/last files.
+                 progress_every=50, progress_seconds=30., load_workers=0, resume_checkpoint=None,
+                 validation_batch_size=None, log_dir=None):
+    """Train one task, write batch/epoch TensorBoard metrics and best/last files.
 
     ``model_config`` accepts ``vector_dim``, ``hidden_size`` and
     ``heading_residual``, ``action_frame`` ('body' by default or 'world') and
@@ -519,6 +558,18 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     threads. training-status.json updates after progress_every chunks or
     progress_seconds, including epoch-zero baselines. history.json and legacy
     training_history.json update atomically each completed epoch.
+    validation_batch_size defaults to batch_size and controls validation and
+    its initial baseline independently of the training batches.
+    Each completed mini-batch logs local Loss, Action_MSE, Action_MAE and Samples
+    (actual valid action steps, excluding padding), then flushes TensorBoard.
+    A mini-batch contains up to batch_size parallel contiguous chunks of at most
+    sequence_length steps; recurrent state continues between chunks. Baseline
+    epoch zero remains epoch-only. Epoch scalars retain the six existing tags.
+    Batch scalars use batches/train and batches/validation below tf_log_dir,
+    each with its own monotonic counter and resume purge boundary. Independent
+    directories prevent an epoch purge from discarding valid batch events.
+    log_dir receives all JSON logs, manifests, split snapshots and configuration;
+    by default it is output_dir. Weights and .pt input snapshots use output_dir.
     resume_checkpoint restores a new-format last.pt at its completed epoch
     boundary: Adam, all RNGs, split, normalization and history. Dataset bytes,
     numerical settings and CUDA topology must agree. epochs is the final target,
@@ -536,7 +587,9 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     The initial checkpoint is a candidate for best, so a worsening run preserves
     its actual best model instead of claiming its final epoch improved.
     """
+    validation_batch_size = batch_size if validation_batch_size is None else validation_batch_size
     for name, value in [("epochs", epochs), ("batch_size", batch_size),
+                        ("validation_batch_size", validation_batch_size),
                         ("sequence_length", sequence_length), ("hidden_size", hidden_size),
                         ("num_threads", num_threads), ("progress_every", progress_every)]:
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -566,7 +619,9 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         torch.cuda.manual_seed_all(seed)
     target_device = torch.device(device)
     output_dir, tf_log_dir = Path(output_dir), Path(tf_log_dir)
+    log_dir = output_dir if log_dir is None else Path(log_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
     tf_log_dir.mkdir(parents=True, exist_ok=True)
     run_started = time.perf_counter()
     status = dict(task=task, pid=os.getpid(), state="running", phase="preparing", epoch=0,
@@ -577,7 +632,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         status.update(values)
         status.update(updated_at=datetime.now(timezone.utc).isoformat(),
                       run_elapsed_seconds=time.perf_counter()-run_started)
-        _write_json(output_dir / "training-status.json", status)
+        _write_json(log_dir / "training-status.json", status)
 
     publish_status()
     runtime_configuration = _runtime_configuration()
@@ -659,7 +714,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         reference_split = reference.get("dataset_split")
         if not isinstance(reference_split, dict) or not reference_split.get("train_paths"):
             raise ValueError("split reference requires complete historical scene assignments")
-        reference_snapshot = output_dir / "split-references" / f"{reference_sha256}.json"
+        reference_snapshot = log_dir / "split-references" / f"{reference_sha256}.json"
         reference_snapshot.parent.mkdir(parents=True, exist_ok=True)
         _write_json(reference_snapshot, dict(checkpoint=str(reference_path), sha256=reference_sha256,
                                             dataset_split=reference_split))
@@ -697,12 +752,13 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
     elif normalize_vectors:
         mean, std = _fit_vector_normalization(train_dataset, model, minimum_std=normalization_min_std)
         model.set_vector_normalization(mean, std)
-    _write_json(output_dir / "dataset_split.json", split)
+    _write_json(log_dir / "dataset_split.json", split)
     for subset, key in [("train", "train_paths"), ("val", "validation_paths")]:
-        _write_json(output_dir / f"{subset}_manifest.json",
+        _write_json(log_dir / f"{subset}_manifest.json",
                     dict(task=task, paths=split[key], seed=seed, split_unit=split["split_unit"]))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    train_config = dict(epochs=epochs, batch_size=batch_size, sequence_length=sequence_length,
+    train_config = dict(epochs=epochs, batch_size=batch_size, validation_batch_size=validation_batch_size,
+                        sequence_length=sequence_length,
                         learning_rate=float(learning_rate), weight_decay=float(weight_decay),
                         grad_clip=float(grad_clip), validation_fraction=float(validation_fraction),
                         seed=int(seed), hidden_size=model.hidden_size, device=str(target_device),
@@ -782,6 +838,8 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
         for key in exact_keys:
             if train_config[key] != saved_config[key]:
                 raise ValueError(f"exact resume training config mismatch for {key}")
+        if validation_batch_size != saved_config.get("validation_batch_size", saved_config["batch_size"]):
+            raise ValueError("exact resume training config mismatch for validation_batch_size")
         if resume_payload.get("torch_version") != str(torch.__version__):
             raise ValueError("exact resume requires the same PyTorch version")
         if resume_payload.get("runtime_configuration") != runtime_configuration:
@@ -794,13 +852,23 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
             train_config[key] = saved_config.get(key)
         normalization = resume_state["normalization"]
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+    _write_json(log_dir / "train_config.json", train_config)
+    _write_json(log_dir / "model_config.json", model.model_config)
     dataset_metadata = read_episode_metadata(train_dataset.paths[0])
     best_path, last_path = output_dir / "best.pt", output_dir / "last.pt"
     export_path = output_dir / f"{task}_policy.pt"
     rng = np.random.default_rng(seed)
     history = []
+    batch_steps = dict(Train=0, Validation=0)
+    if resume_state is not None:
+        saved_batch_steps = resume_payload.get("batch_steps", batch_steps)
+        if (set(saved_batch_steps) != set(batch_steps) or
+                any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                    for value in saved_batch_steps.values())):
+            raise ValueError("exact resume checkpoint batch counters are invalid")
+        batch_steps.update(saved_batch_steps)
 
-    def run_phase(phase, epoch, dataset, **kwargs):
+    def run_phase(phase, epoch, dataset, batch_callback=None, **kwargs):
         publish_status(phase=phase, epoch=epoch, chunks=0, processed_steps=0,
                        episodes_completed=0, episodes_total=len(dataset), metrics=None,
                        gradient_norm=None, elapsed_seconds=0., data_load_seconds=0.)
@@ -809,9 +877,11 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
             values["operation"] = values.pop("phase")
             publish_status(phase=phase, epoch=epoch, **values)
         try:
-            return _run_epoch(model, dataset, batch_size, sequence_length, target_device,
+            phase_batch_size = validation_batch_size if phase in {"initial_validation", "validation"} else batch_size
+            return _run_epoch(model, dataset, phase_batch_size, sequence_length, target_device,
                               field_steering_loss_weight=field_steering_loss_weight,
                               load_workers=load_workers, progress_callback=progress,
+                              batch_callback=batch_callback,
                               progress_every=progress_every, progress_seconds=progress_seconds, **kwargs)
         except Exception as error:
             publish_status(state="failed", error=f"{type(error).__name__}: {error}")
@@ -851,6 +921,7 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                          torch_version=str(torch.__version__), rng=_capture_rng_state(rng),
                          runtime_configuration=runtime_configuration,
                          dataset_identity=dataset_identity, history=history,
+                         batch_steps=dict(batch_steps),
                          initial_train=initial_train, initial_validation=initial_validation,
                          best_selection_mse=best_mse, best_epoch=best_epoch,
                          best_checkpoint_sha256=hashlib.sha256(best_bytes).hexdigest() if best_bytes else None,
@@ -886,11 +957,26 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
                       initial_checkpoint_sha256=origin_sha256,
                       resume_checkpoint=None if resume_path is None else str(resume_path),
                       validation_available=initial_validation is not None)
-        _write_json(output_dir / "history.json", result)
-        _write_json(output_dir / "training_history.json", result)
+        _write_json(log_dir / "history.json", result)
+        _write_json(log_dir / "training_history.json", result)
         return result
 
-    with SummaryWriter(log_dir=str(tf_log_dir), purge_step=start_epoch + 1 if resume_state is not None else None) as writer:
+    if resume_state is not None:
+        _wait_for_tensorboard_resume(tf_log_dir)
+    with (SummaryWriter(log_dir=str(tf_log_dir),
+                        purge_step=start_epoch + 1 if resume_state is not None else None) as writer,
+          SummaryWriter(log_dir=str(tf_log_dir / "batches" / "train"),
+                        purge_step=batch_steps["Train"] + 1 if resume_state is not None else None) as train_writer,
+          SummaryWriter(log_dir=str(tf_log_dir / "batches" / "validation"),
+                        purge_step=batch_steps["Validation"] + 1 if resume_state is not None else None) as validation_writer):
+        def log_batch(subset, metrics):
+            batch_steps[subset] += 1
+            batch_writer = train_writer if subset == "Train" else validation_writer
+            for tag, key in [("Loss", "loss"), ("Action_MSE", "action_mse"),
+                             ("Action_MAE", "action_mae"), ("Samples", "steps")]:
+                batch_writer.add_scalar(f"Batch/{subset}/{tag}", metrics[key], batch_steps[subset])
+            batch_writer.flush()
+
         def log_metrics(subset, metrics, epoch):
             for tag, key in [("Loss", "loss"), ("Action_MSE", "action_mse"), ("Action_MAE", "action_mae")]:
                 writer.add_scalar(f"{subset}/{tag}", metrics[key], epoch)
@@ -919,10 +1005,12 @@ def train_policy(task, dataset_dir, output_dir, tf_log_dir, *, epochs=100, batch
             order = rng.permutation(training_order).tolist()
             train_metrics = run_phase("train", epoch, train_dataset, optimizer=optimizer,
                                       grad_clip=grad_clip, order=order,
+                                      batch_callback=lambda metrics: log_batch("Train", metrics),
                                       correction_weight_max=correction_weight_max,
                                       correction_threshold=correction_threshold)
             publish_status(train_metrics=train_metrics)
-            validation_metrics = (run_phase("validation", epoch, validation_dataset)
+            validation_metrics = (run_phase("validation", epoch, validation_dataset,
+                                            batch_callback=lambda metrics: log_batch("Validation", metrics))
                                   if len(validation_dataset) else None)
             selection_metrics = validation_metrics
             if selection_metrics is None:

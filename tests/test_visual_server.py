@@ -172,3 +172,51 @@ def test_rebuilt_replay_index_preserves_control_mode_and_existing_entry_fields(v
     assert rebuilt['fingerprint']==[stat.st_mtime_ns,stat.st_size]
     assert item==dict(expected,name='copied-policy.json',url='/outputs/copied-policy.json',
                       modified=stat.st_mtime,bytes=stat.st_size)
+
+
+def test_npz_catalog_and_http_convert_replay_without_training_arrays(visual_server):
+    import numpy as np
+    from episode_io import write_episode
+    record={'task':'tracking','actor':'policy','scene':{},'frames':[{'t':0},{'t':1}],
+            'metadata':{'task':'tracking'},'actions':[[1,0]],'executed_actions':[[1,0]],
+            'observations':{'vector':np.ones((2,134),np.float32)}}
+    path=write_episode(visual_server.output_dir/'eval'/'policy.npz',record)
+    with urlopen(visual_server.url+'api/replays') as response:
+        item=next(row for row in json.load(response)['replays'] if row['name']=='eval/policy.npz')
+    with urlopen(visual_server.url.rstrip('/')+item['url']) as response:
+        assert response.headers['Content-Type'].startswith('application/json')
+        import hashlib
+        assert response.headers['X-Replay-SHA256']==hashlib.sha256(path.read_bytes()).hexdigest()
+        replay=json.load(response)
+    assert replay['actions']==[[1,0]] and 'observations' not in replay
+    assert not path.with_suffix('.json').exists()
+
+
+def test_local_npz_import_is_bounded_same_origin_and_does_not_persist(visual_server):
+    from episode_io import write_episode
+    path=write_episode(visual_server.output_dir/'source.npz',
+        {'task':'coverage','actor':'expert','scene':{},'frames':[{'t':0}]})
+    def upload(body,**headers):
+        connection=http.client.HTTPConnection(visual_server.host,visual_server.port,timeout=3)
+        connection.request('POST','/api/replays/convert',body=body,
+            headers={'Content-Type':'application/octet-stream',**headers})
+        response=connection.getresponse();result=response.status,json.loads(response.read());connection.close()
+        return result
+    before=set(visual_server.output_dir.rglob('*'))
+    status,replay=upload(path.read_bytes())
+    assert status==200 and replay['actor']=='expert' and replay['frames']==[{'t':0}]
+    assert set(visual_server.output_dir.rglob('*'))==before
+    assert upload(b'not zip')[0]==400
+    assert upload(b'x',Origin='https://other.invalid')[0]==403
+    assert upload(b'',**{'Content-Length':str(128*1024*1024+1)})[0]==413
+
+
+def test_import_concurrency_is_bounded_before_reading_request_body(visual_server):
+    assert visual_server._replay_import_slot.acquire(blocking=False)
+    try:
+        connection=http.client.HTTPConnection(visual_server.host,visual_server.port,timeout=3)
+        connection.request('POST','/api/replays/convert',body=b'x',headers={'Content-Type':'application/octet-stream'})
+        response=connection.getresponse()
+        assert response.status==429 and 'conversion' in json.loads(response.read())['error'].lower()
+        connection.close()
+    finally:visual_server._replay_import_slot.release()

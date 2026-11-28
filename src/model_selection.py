@@ -30,10 +30,10 @@ def _evaluate_candidate(job):
     from config import Config
     from env_coverage import CoverageEnv
     from env_tracking import TrackingEnv
-    from rollouts import json_value, write_json, write_replay_index
+    from rollouts import json_value, write_episode, write_replay_index, load_replay
     from .policy_tracking import load_policy
     torch.set_num_threads(job['num_threads'])
-    source=json.loads(Path(job['episode_path']).with_suffix('.json').read_text(encoding='utf-8'))
+    source=load_replay(job['episode_path'])
     scene=deepcopy(source['scene']);task=job['task'];duration=job['duration']
     values=scene['config_snapshot'];values[f'{task}_episode_seconds']=duration
     config=Config.from_dict(values);scene['episode_seconds']=duration;scene['config_snapshot']=config.to_dict()
@@ -66,7 +66,7 @@ def _evaluate_candidate(job):
     metadata['validation_pan_stress']=stress
     record={'schema_version':'maritime-replay-v1','task':task,'actor':'policy','seed':source['seed'],'scene':scene,
         'metadata':metadata,'frames':frames,'actions':actions,'executed_actions':executed,'summary':summary}
-    path=Path(job['output']);write_json(path,record);write_replay_index(path,record);env.close()
+    path=write_episode(job['output'],record);write_replay_index(path,record);env.close()
     return {'path':str(path.resolve()),'scene_group_id':group,'summary':summary}
 
 
@@ -100,7 +100,7 @@ def select_checkpoint(task,model_dir,output_dir,*,coverage_seconds=10800.,tracki
         reference_split=split
         train_groups={read_episode_metadata(p).get('scene_group_id') for p in split['train_paths']}
         if not split['validation_paths']:raise ValueError('Selection requires validation scenes; disable explicitly for training-only runs')
-        digest=hashlib.sha256(payload).hexdigest();snapshot_dir=output_dir/'checkpoints';snapshot_dir.mkdir(exist_ok=True)
+        digest=hashlib.sha256(payload).hexdigest();snapshot_dir=model_dir/'selection-snapshots';snapshot_dir.mkdir(exist_ok=True)
         snapshot=snapshot_dir/f'{tag}-{digest}.pt'
         if not snapshot.exists():snapshot.write_bytes(payload)
         if hashlib.sha256(snapshot.read_bytes()).hexdigest()!=digest:raise ValueError('Candidate snapshot hash mismatch')
@@ -115,7 +115,7 @@ def select_checkpoint(task,model_dir,output_dir,*,coverage_seconds=10800.,tracki
                 jobs.append({'task':task,'tag':tag,'checkpoint':str(snapshot.resolve()),'episode_path':str(episode),'scene_group_id':group,
                     'duration':coverage_seconds if task=='coverage' else tracking_seconds,'render_every':render_every,
                     'pan_offset':offset,'num_threads':num_threads,
-                    'output':str(output_dir/f'{tag}-validation-{index}-stress-{stress_index}.json')})
+                    'output':str(output_dir/f'{tag}-validation-{index}-stress-{stress_index}.npz')})
     if workers==1:results=list(map(_evaluate_candidate,jobs))
     else:
         with ProcessPoolExecutor(max_workers=workers) as pool:results=list(pool.map(_evaluate_candidate,jobs))
@@ -132,5 +132,5 @@ def select_checkpoint(task,model_dir,output_dir,*,coverage_seconds=10800.,tracki
         'selected_sha256':candidates[chosen]['sha256'] if accepted else None,'candidates':candidates,
         'criterion':'safe complete episodes, full coverage/visibility count, worst quality, mean quality',
         'tracking_pan_stress_radians':tracking_pan_stress,'durations':{'coverage':coverage_seconds,'tracking':tracking_seconds}}
-    write_json(output_dir/'selection.json',result);write_json(model_dir/'selection.json',result)
+    write_json(output_dir/'selection.json',result)
     return result

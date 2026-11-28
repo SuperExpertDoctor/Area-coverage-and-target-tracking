@@ -27,6 +27,29 @@ def experiment_name(value):
     return value
 
 
+def reserve_experiment(output_dir, tf_log_dir):
+    """Reserve both experiment names before writing configuration or caches."""
+    directories=(Path(output_dir),Path(tf_log_dir))
+    conflicts=[str(path) for path in directories if path.exists() or path.is_symlink()]
+    if conflicts:
+        raise FileExistsError('Experiment name already exists: '+', '.join(conflicts)+
+                              '; choose a new --experiment-name')
+    resolved=tuple(path.resolve() for path in directories)
+    if (resolved[0]==resolved[1] or resolved[0] in resolved[1].parents
+            or resolved[1] in resolved[0].parents):
+        raise ValueError('Experiment output and TensorBoard directories must be separate')
+    created=[]
+    try:
+        for path in directories:
+            path.mkdir(parents=True,exist_ok=False)
+            created.append(path)
+    except BaseException:
+        for path in reversed(created):
+            try:path.rmdir()
+            except OSError:pass  # Never remove files another process has written.
+        raise
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--mode', choices=['formal','all','expert','expert-validate','collect','train','dagger','evaluate','serve'], default='all')
@@ -77,12 +100,13 @@ def parser():
     p.add_argument('--collection-attempt-multiplier', type=int, default=3)
     p.add_argument('--collection-workers',type=int,default=1)
     p.add_argument('--collection-replay-every',type=int,default=60)
-    p.add_argument('--collection-resume',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--collection-require-task-success',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--collection-coverage-seconds', type=float, default=5400.)
     p.add_argument('--collection-tracking-seconds', type=float, default=1800.)
     p.add_argument('--epochs', type=int, default=30)
     p.add_argument('--batch-size', type=int, default=4)
+    p.add_argument('--validation-batch-size', type=int, default=4,
+                   help='Parallel validation sequences per batch; padding is excluded from metrics')
     p.add_argument('--sequence-length', type=int, default=64)
     p.add_argument('--learning-rate', type=float, default=3e-4)
     p.add_argument('--weight-decay', type=float, default=1e-5)
@@ -142,11 +166,9 @@ def parser():
     p.add_argument('--validation-tracking-seconds',type=float,default=1800.)
     p.add_argument('--validation-trajectory-every',type=float,default=60.)
     p.add_argument('--validation-coverage-ratio',type=float,default=1.)
-    p.add_argument('--validation-resume',action=argparse.BooleanOptionalAction,default=True)
     p.add_argument('--training-progress-every',type=int,default=50)
     p.add_argument('--training-progress-seconds',type=float,default=30.)
     p.add_argument('--training-load-workers',type=int,default=0)
-    p.add_argument('--resume-checkpoint',type=Path,default=None)
     p.add_argument('--recording-fps',type=int,default=24)
     p.add_argument('--recording-width',type=int,default=1440)
     p.add_argument('--recording-height',type=int,default=900)
@@ -156,13 +178,12 @@ def parser():
     p.add_argument('--recording-max-seconds',type=float,default=600.)
     p.add_argument('--browser-recording',action=argparse.BooleanOptionalAction,default=False)
     p.add_argument('--recording-headless',action=argparse.BooleanOptionalAction,default=True)
-    p.add_argument('--formal-test-episodes',type=int,default=8)
-    p.add_argument('--formal-test-seed',type=int,default=940000)
-    p.add_argument('--formal-test-workers',type=int,default=4)
-    p.add_argument('--formal-test-replay-every',type=int,default=60)
-    p.add_argument('--formal-coverage-safety-layer',choices=['none','forecast'],default='forecast')
+    p.add_argument('--eval-episodes','--formal-test-episodes',dest='formal_test_episodes',type=int,default=30)
+    p.add_argument('--eval-seed','--formal-test-seed',dest='formal_test_seed',type=int,default=940000)
+    p.add_argument('--eval-workers','--formal-test-workers',dest='formal_test_workers',type=int,default=4)
+    p.add_argument('--eval-replay-every','--formal-test-replay-every',dest='formal_test_replay_every',type=int,default=60)
+    p.add_argument('--formal-coverage-safety-layer',choices=['none','forecast'],default='none')
     p.add_argument('--formal-monitor-seconds',type=float,default=30.)
-    p.add_argument('--formal-resume',action=argparse.BooleanOptionalAction,default=True)
     return p
 
 
@@ -186,15 +207,23 @@ def main(argv=None):
         args.output_dir=args.output_dir/'field-v2'
     # Keep bytecode, matplotlib configuration and optional package caches with outputs.
     out = args.output_dir.resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    if args.mode=='serve':
+        if not out.is_dir():
+            raise FileNotFoundError(f'Experiment output directory does not exist: {out}')
+    elif args.experiment_name is not None:
+        reserve_experiment(args.output_dir,args.tf_log_dir)
+    else:
+        out.mkdir(parents=True, exist_ok=True)
+    args.tf_log_dir = args.tf_log_dir.resolve()
     import os
-    sys.pycache_prefix = str(out/'cache'/'python')
-    os.environ['PYTHONPYCACHEPREFIX'] = sys.pycache_prefix
-    os.environ['MPLCONFIGDIR'] = str(out/'cache'/'matplotlib')
-    os.environ['XDG_CACHE_HOME'] = str(out/'cache')
+    logs = out/'logs'
+    if args.mode!='serve':
+        sys.pycache_prefix = str(logs/'cache'/'python')
+        os.environ['PYTHONPYCACHEPREFIX'] = sys.pycache_prefix
+        os.environ['MPLCONFIGDIR'] = str(logs/'cache'/'matplotlib')
+        os.environ['XDG_CACHE_HOME'] = str(logs/'cache')
     from rollouts import run_episode, write_json
     from visual_server import VisualServer
-    args.tf_log_dir = args.tf_log_dir.resolve()
     if args.device=='auto' and args.mode in ['formal','all','train','dagger','evaluate']:
         import torch
         args.device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -205,7 +234,7 @@ def main(argv=None):
         raise ValueError('Need at least two demonstration episodes and positive training settings')
     if min(args.collection_workers,args.collection_replay_every,args.formal_test_workers,
            args.formal_test_episodes,args.formal_test_replay_every,args.training_progress_every,
-           args.num_threads,args.inference_num_threads,args.batch_size,args.sequence_length,args.hidden_size)<1:
+           args.num_threads,args.inference_num_threads,args.batch_size,args.validation_batch_size,args.sequence_length,args.hidden_size)<1:
         raise ValueError('Collection, progress and test counts must be positive')
     if any(not math.isfinite(value) or value<=0 for value in (args.formal_monitor_seconds,
             args.training_progress_seconds,args.learning_rate,args.grad_clip,
@@ -213,17 +242,18 @@ def main(argv=None):
         raise ValueError('Progress intervals must be positive')
     if min(args.expert_seed,args.collection_seed,args.formal_test_seed)<0:
         raise ValueError('Scene seeds must be nonnegative')
-    if args.mode=='formal' and (args.checkpoint_path or args.resume_checkpoint or args.warm_start
+    if args.mode=='formal' and (args.checkpoint_path or args.warm_start
                                or args.dataset_manifest or args.split_reference_checkpoint):
-        raise ValueError('Formal run owns fresh datasets and exact-resume checkpoints; external inputs are not accepted')
+        raise ValueError('Formal run owns fresh datasets and checkpoints; external inputs are not accepted')
     if (args.checkpoint_path or args.dataset_manifest) and args.task=='both':
         raise ValueError('Explicit checkpoint/manifest requires one --task')
     if not 0<=args.dagger_beta<=1 or args.dagger_episodes<1 or args.dagger_max_steps<0 or args.dagger_iteration<1:
         raise ValueError('Invalid DAgger collection settings')
     run_config = {k: str(v) if isinstance(v,Path) else v for k,v in vars(args).items()}
     run_config['simulation'] = asdict(cfg)
-    write_json(out/'run-config.json',run_config)
-    write_json(out/'configs'/f'{args.run_name}-{args.mode}.json',run_config)
+    if args.mode!='serve':
+        write_json(logs/'run-config.json',run_config)
+        write_json(logs/'configs'/f'{args.run_name}-{args.mode}.json',run_config)
     server = VisualServer(PROJECT_ROOT,out,args.host,args.port,
         visual_config={key:value for key,value in cfg.to_dict().items() if key.startswith('visual_')},
         recording_config={key:value for key,value in vars(args).items() if key in (
@@ -235,8 +265,8 @@ def main(argv=None):
         if args.open_browser: webbrowser.open(server.url)
     report = {'simulation_config':asdict(cfg),'tasks':{}}
     def save_report():
-        write_json(out/'reports'/f'{args.mode}-report.json',report)
-        existing_path=out/'validation-report.json'
+        write_json(logs/'reports'/f'{args.mode}-report.json',report)
+        existing_path=logs/'validation-report.json'
         existing=json.loads(existing_path.read_text(encoding='utf-8')) if existing_path.exists() else {'tasks':{}}
         existing['simulation_config']=asdict(cfg)
         for task_name,details in report['tasks'].items():
@@ -248,14 +278,14 @@ def main(argv=None):
             from src.formal_run import run_formal
             report=run_formal(args,cfg,tasks,server,run_config)
             if not report['task_goals_passed']:
-                raise RuntimeError('Latest policies failed a declared task goal; inspect formal-report.json')
+                raise RuntimeError(f'Latest policies failed a declared task goal; inspect {logs / "formal-report.json"}')
             if server and args.keep_server:
                 print(f'Formal run complete. Replay interface: {server.url}',flush=True)
                 while True: time.sleep(.5)
             return report
         if args.mode=='expert-validate':
             from expert_validation import run_validation
-            suite=run_validation(cfg,output_dir=out/'diagnostics'/'expert-randomized',
+            suite=run_validation(cfg,output_dir=logs/'diagnostics'/'expert-randomized',
                 coverage_seeds=args.validation_coverage_seeds if args.task!='tracking' else [],
                 boundary_scene_seeds=args.validation_boundary_seeds if args.task!='tracking' else [],
                 boundary_starts=args.validation_boundary_starts,
@@ -263,13 +293,13 @@ def main(argv=None):
                 workers=args.validation_workers,coverage_seconds=args.validation_coverage_seconds,
                 tracking_seconds=args.validation_tracking_seconds,
                 trajectory_every=args.validation_trajectory_every,
-                coverage_success_ratio=args.validation_coverage_ratio,resume=args.validation_resume)
+                coverage_success_ratio=args.validation_coverage_ratio,resume=False)
             print(json.dumps({key:value for key,value in suite.items() if key!='results'},ensure_ascii=False,indent=2),flush=True)
             if not suite['all_eligible_passed']:
                 raise RuntimeError('Expert validation has failed cases; inspect suite-summary.json')
             return suite
         if args.mode == 'serve':
-            print('Serving saved JSON histories. Press Ctrl+C to stop.',flush=True)
+            print('Serving NPZ/legacy JSON histories. Press Ctrl+C to stop.',flush=True)
             while True: time.sleep(.5)
         for task in tasks:
             task_index={'coverage':0,'tracking':1}[task]
@@ -301,10 +331,10 @@ def main(argv=None):
                 return None
             if args.mode in ['all','expert']:
                 seed=args.expert_seed+task_index
-                demo,path=rollout(cfg,expert_class(cfg),'expert',seed,out/'replays',f'{task}-expert-{seed}')
+                demo,path=rollout(cfg,expert_class(cfg),'expert',seed,out/'datasets'/'preflight',f'{task}-expert-{seed}')
                 item['expert']=demo['summary']
-                item['expert_json']=str(path.resolve())
-                item['expert_video']=video(demo,out/'videos'/f'{task}-expert.mp4')
+                item['expert_npz']=str(path.resolve())
+                item['expert_video']=video(demo,logs/'videos'/f'{task}-expert.mp4')
                 save_report()
                 if args.mode=='all' and demo['summary']['terminated']:
                     raise RuntimeError(f'{task} expert demonstration failed; inspect {path}. Training is not started.')
@@ -320,15 +350,11 @@ def main(argv=None):
                     episodes=args.episodes,seed=args.collection_seed+task_index*10000,
                     workers=args.collection_workers,attempt_multiplier=args.collection_attempt_multiplier,
                     replay_every=args.collection_replay_every,progress_every=args.progress_every,
-                    server=server,resume=args.collection_resume,
+                    server=server,resume=False,
                     require_task_success=args.collection_require_task_success)
                 item['collection']={key:collection[key] for key in ['accepted','rejected']}
-            model_dir=out/'models'/task
+            model_dir=out/'weights'/task
             deployment=model_dir/'selected.pt'
-            if (args.mode=='evaluate' and cfg.potential_enabled and args.closed_loop_selection
-                    and args.checkpoint_path is None and not deployment.is_file()):
-                raise FileNotFoundError(f'No validated deployment checkpoint: {deployment}. '
-                    'Run closed-loop selection first, or specify --checkpoint-path for diagnostic evaluation.')
             checkpoint=args.checkpoint_path or (deployment if cfg.potential_enabled and args.closed_loop_selection and deployment.exists() else model_dir/'best.pt')
             if args.mode in ['all','train','dagger']:
                 from src.train import train_policy
@@ -386,7 +412,7 @@ def main(argv=None):
                     if task=='coverage' and not cfg.potential_enabled and args.coverage_ego_map and not saved['model_config'].get('ego_map_channels',False):
                         from src.policy_coverage import upgrade_coverage_checkpoint
                         initial_checkpoint=upgrade_coverage_checkpoint(initial_checkpoint,
-                            out/'initial-checkpoints'/task/args.run_name/'ego-upgrade.pt',
+                            out/'weights'/'initial-checkpoints'/task/args.run_name/'ego-upgrade.pt',
                             ego_map_sigma=args.coverage_ego_map_sigma,
                             ego_map_mode=args.coverage_ego_map_mode)
                         saved=torch.load(initial_checkpoint,map_location='cpu',weights_only=False)
@@ -395,8 +421,9 @@ def main(argv=None):
                         print(f"[coverage] mask_previous_command={model_config.get('mask_previous_command',False)} "
                               "inherited from checkpoint (fresh-training flag is not applied)",flush=True)
                 training=train_policy(task,manifest_path if manifest_path.exists() else dataset_dir,
-                    out/'models'/task,args.tf_log_dir/task/args.run_name,
-                    epochs=args.epochs,batch_size=args.batch_size,sequence_length=args.sequence_length,
+                    model_dir,args.tf_log_dir/task/args.run_name,
+                    epochs=args.epochs,batch_size=args.batch_size,validation_batch_size=args.validation_batch_size,
+                    sequence_length=args.sequence_length,log_dir=logs/'training'/task,
                     learning_rate=args.learning_rate,weight_decay=args.weight_decay,grad_clip=args.grad_clip,
                     validation_fraction=args.validation_fraction,seed=args.training_seed,
                     hidden_size=args.hidden_size,device=args.device,num_threads=args.num_threads,
@@ -410,57 +437,64 @@ def main(argv=None):
                     initial_checkpoint=initial_checkpoint,
                     split_reference_checkpoint=args.split_reference_checkpoint,
                     progress_every=args.training_progress_every,progress_seconds=args.training_progress_seconds,
-                    load_workers=args.training_load_workers,resume_checkpoint=args.resume_checkpoint,
+                    load_workers=args.training_load_workers,
                     metadata={'simulation_config':asdict(cfg),'command':run_config})
                 item['training']=training
                 checkpoint=Path(training['best_checkpoint'])
                 if cfg.potential_enabled and args.closed_loop_selection:
                     from src.model_selection import select_checkpoint
-                    selection=select_checkpoint(task,model_dir,out/'selection'/task/args.run_name,
+                    selection=select_checkpoint(task,model_dir,out/'eval'/'validation'/task/args.run_name,
                         coverage_seconds=args.selection_coverage_seconds,tracking_seconds=args.selection_tracking_seconds,
                         render_every=args.selection_render_every,num_threads=args.num_threads,workers=args.selection_workers,
                         tracking_pan_stress=args.selection_tracking_pan_stress)
                     training['closed_loop_selection']=selection
                     if selection['accepted']:
                         checkpoint=Path(selection['selected_checkpoint'])
-                write_json(out/'training'/f'{task}-report.json',training)
-                if cfg.potential_enabled and args.closed_loop_selection and not training['closed_loop_selection']['accepted']:
-                    save_report()
-                    raise RuntimeError('No field checkpoint passed closed-loop validation; inspect selection.json. No deployment model promoted.')
-            if args.mode in ['all','dagger','evaluate']:
-                from src.policy_tracking import NeuralPolicy
-                if not checkpoint.exists():
-                    if args.checkpoint_path is not None:
-                        raise FileNotFoundError(f'Explicit checkpoint is missing: {checkpoint}')
-                    # Newer checkpoint naming remains discoverable without a private path.
-                    matches=list((out/'models'/task).glob('*best*.pt'))
-                    if not matches: raise FileNotFoundError(f'No trained {task} checkpoint in {out/"models"/task}')
-                    checkpoint=matches[0]
-                import torch
-                torch.set_num_threads(args.inference_num_threads)
-                actor=NeuralPolicy.from_checkpoint(checkpoint,device=args.inference_device)
-                seed=args.expert_seed+task_index
-                expert_record=demo
-                reference=out/'replays'/f'{task}-expert-{seed}.json'
-                if expert_record is None and reference.exists():
-                    expert_record=json.loads(reference.read_text(encoding='utf-8'))
-                scene=expert_record['scene'] if expert_record else None
-                evaluation_cfg=cfg
-                if scene and scene.get('config_snapshot'):
-                    evaluation_cfg=Config.from_dict(scene['config_snapshot'])
-                if args.policy_safety_layer == 'forecast':
-                    if not evaluation_cfg.potential_enabled:
-                        raise ValueError('The forecast constraint layer requires a field-v2 reference scene')
-                    from src.policy_constraints import ForecastConstrainedPolicy
-                    actor=ForecastConstrainedPolicy(actor,evaluation_cfg,task)
-                record,path=rollout(evaluation_cfg,actor,'policy',seed,out/'replays',f'{task}-policy-{seed}',scene=scene)
-                if expert_record and record['metadata']['scene_id']!=expert_record['metadata']['scene_id']:
-                    raise RuntimeError('Expert and policy evaluation scenes differ')
-                item['evaluation_scene_id']=record['metadata']['scene_id']
-                item['policy_checkpoint']=record['metadata'].get('policy_checkpoint')
-                item['control_mode']=record['metadata'].get('control_mode','pure_network')
-                item['policy']=record['summary'];item['policy_json']=str(path.resolve())
-                item['policy_video']=video(record,out/'videos'/f'{task}-policy.mp4')
+                write_json(logs/'training'/f'{task}-report.json',training)
+            if args.mode in ['all','train','dagger','evaluate']:
+                from src.evaluation import evaluate_policy
+                from src.formal_run import freeze_checkpoint, freeze_latest
+                if args.mode=='evaluate' and args.checkpoint_path is not None:
+                    if not args.checkpoint_path.is_file():
+                        raise FileNotFoundError(f'Explicit checkpoint is missing: {args.checkpoint_path}')
+                    frozen=freeze_checkpoint(task,args.checkpoint_path,out/'weights'/'frozen-latest')
+                else:
+                    # The fresh test set never promotes or chooses checkpoint weights.
+                    frozen=freeze_latest(task,model_dir,out/'weights'/'frozen-latest')
+                excluded=set(frozen.get('excluded_scene_groups',[]))
+                evaluation_seeds=set(range(args.formal_test_seed+task_index*10000,
+                    args.formal_test_seed+task_index*10000+args.formal_test_episodes))
+                if evaluation_seeds.intersection(frozen.get('training_seeds',[])):
+                    raise ValueError('Evaluation seeds overlap checkpoint training/validation episodes')
+                if manifest_path.is_file():
+                    from src.datasets import read_episode_metadata
+                    manifest=json.loads(manifest_path.read_text(encoding='utf-8'))
+                    for entry in manifest.get('paths',[]):
+                        path=Path(entry)
+                        if not path.is_absolute():path=manifest_path.parent/path
+                        group=read_episode_metadata(path).get('scene_group_id')
+                        if group:excluded.add(group)
+                    collection_identity=manifest.get('identity',{})
+                    start=collection_identity.get('seed')
+                    count=collection_identity.get('episodes',0)*collection_identity.get('attempt_multiplier',1)
+                    if start is not None and set(range(start,start+count)).intersection(range(
+                            args.formal_test_seed+task_index*10000,
+                            args.formal_test_seed+task_index*10000+args.formal_test_episodes)):
+                        raise ValueError('Evaluation seeds overlap expert collection')
+                evaluation=evaluate_policy(task,cfg,frozen,out/'eval'/task/args.policy_safety_layer,
+                    episodes=args.formal_test_episodes,seed=args.formal_test_seed+task_index*10000,
+                    workers=args.formal_test_workers,mode=args.policy_safety_layer,
+                    excluded_scene_groups=sorted(excluded),replay_every=args.formal_test_replay_every,
+                    progress_every=args.progress_every,inference_device=args.inference_device,
+                    inference_num_threads=args.inference_num_threads,
+                    server=server if args.formal_test_workers==1 else None)
+                item['evaluation']=evaluation
+                item['control_mode']='forecast_constraint' if args.policy_safety_layer=='forecast' else 'pure_network'
+                item['policy_checkpoint']=frozen
+                save_report()
+                if ('training' in item and cfg.potential_enabled and args.closed_loop_selection
+                        and not item['training']['closed_loop_selection']['accepted']):
+                    raise RuntimeError('No field checkpoint passed closed-loop validation; inspect selection.json. Final inference evaluation is saved separately.')
             save_report()
         concise={task:{key:value for key,value in details.items() if key in ['expert','policy']}
                  for task,details in report['tasks'].items()}

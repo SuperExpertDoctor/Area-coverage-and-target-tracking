@@ -11,6 +11,22 @@ import pytest
 import torch
 
 
+def training_result(model_dir):
+    model_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(dict(task=model_dir.name, epoch=1), model_dir / 'last.pt')
+    return dict(best_checkpoint=str(model_dir / 'best.pt'), last_checkpoint=str(model_dir / 'last.pt'),
+                initial_validation_mse=1., best_validation_mse=.5, best_epoch=1)
+
+
+@pytest.fixture(autouse=True)
+def lightweight_inference_evaluation(monkeypatch):
+    # These CLI tests isolate option routing; actual 30-case scheduling and
+    # artifact provenance are exercised in test_experiment_workflow/evaluation.
+    evaluation = importlib.import_module('src.evaluation')
+    monkeypatch.setattr(evaluation, 'evaluate_policy', lambda *a, **k:
+        dict(complete=True, requested_episodes=k['episodes'], success_rate=.5, episodes=[]))
+
+
 def cli_args(tmp_path, monkeypatch):
     # main owns runtime cache paths; restore the test process settings afterward.
     monkeypatch.setattr(sys, 'pycache_prefix', sys.pycache_prefix)
@@ -35,28 +51,27 @@ def test_named_experiments_separate_artifacts_training_paths_and_caches(tmp_path
 
     def capture_training(task, dataset, model_dir, tf_dir, **kwargs):
         calls.append((task, dataset, model_dir, tf_dir, kwargs['metadata']['command']))
-        return dict(best_checkpoint=str(model_dir / 'best.pt'), initial_validation_mse=1.,
-                    best_validation_mse=.5, best_epoch=1)
+        return training_result(model_dir)
 
     monkeypatch.setattr(train, 'train_policy', capture_training)
     for name in ('experiment-a', '试验乙.v2'):
         main.main(arguments + ['--experiment-name', name])
         output = output_base / name
         tf_output = tf_base / name
-        persisted = json.loads((output / 'run-config.json').read_text(encoding='utf-8'))
-        archived = json.loads((output / 'configs' / 'interface-test-train.json').read_text(encoding='utf-8'))
+        persisted = json.loads((output / 'logs' / 'run-config.json').read_text(encoding='utf-8'))
+        archived = json.loads((output / 'logs' / 'configs' / 'interface-test-train.json').read_text(encoding='utf-8'))
         assert persisted == archived == json.loads(json.dumps(calls[-1][4]))
         assert persisted['experiment_name'] == name
         assert persisted['output_dir'] == str(output)
         assert persisted['tf_log_dir'] == str(tf_output)
         assert calls[-1][:4] == ('tracking', output / 'datasets' / 'tracking',
-                                output / 'models' / 'tracking', tf_output / 'tracking' / 'interface-test')
-        assert (output / 'training' / 'tracking-report.json').is_file()
-        assert (output / 'reports' / 'train-report.json').is_file()
-        assert (output / 'validation-report.json').is_file()
-        assert sys.pycache_prefix == os.environ['PYTHONPYCACHEPREFIX'] == str(output / 'cache' / 'python')
-        assert os.environ['MPLCONFIGDIR'] == str(output / 'cache' / 'matplotlib')
-        assert os.environ['XDG_CACHE_HOME'] == str(output / 'cache')
+                                output / 'weights' / 'tracking', tf_output / 'tracking' / 'interface-test')
+        assert (output / 'logs' / 'training' / 'tracking-report.json').is_file()
+        assert (output / 'logs' / 'reports' / 'train-report.json').is_file()
+        assert (output / 'logs' / 'validation-report.json').is_file()
+        assert sys.pycache_prefix == os.environ['PYTHONPYCACHEPREFIX'] == str(output / 'logs' / 'cache' / 'python')
+        assert os.environ['MPLCONFIGDIR'] == str(output / 'logs' / 'cache' / 'matplotlib')
+        assert os.environ['XDG_CACHE_HOME'] == str(output / 'logs' / 'cache')
     assert len(calls) == 2
     assert not (output_base / 'run-config.json').exists()
     assert not (output_base / 'field-v2').exists()
@@ -75,15 +90,14 @@ def test_omitting_experiment_name_preserves_legacy_output_paths(tmp_path, monkey
 
     def capture_training(task, dataset, model_dir, tf_dir, **kwargs):
         calls.append((model_dir, tf_dir))
-        return dict(best_checkpoint=str(model_dir / 'best.pt'), initial_validation_mse=1.,
-                    best_validation_mse=.5, best_epoch=1)
+        return training_result(model_dir)
 
     monkeypatch.setattr(train, 'train_policy', capture_training)
     main.main(cli_args(tmp_path, monkeypatch) + [
         '--mode', 'train', '--potential-field' if potential_field else '--no-potential-field',
         '--no-closed-loop-selection', '--output-dir', str(output_base), '--tf-log-dir', str(tf_base)])
-    assert calls == [(output / 'models' / 'tracking', tf_base / 'tracking' / 'interface-test')]
-    persisted = json.loads((output / 'run-config.json').read_text(encoding='utf-8'))
+    assert calls == [(output / 'weights' / 'tracking', tf_base / 'tracking' / 'interface-test')]
+    persisted = json.loads((output / 'logs' / 'run-config.json').read_text(encoding='utf-8'))
     assert persisted['experiment_name'] is None
     assert persisted['output_dir'] == str(output)
 
@@ -202,8 +216,7 @@ def test_main_fresh_cloud_encoder_preserves_only_requested_split_reference(tmp_p
 
     def capture_training(*args, **kwargs):
         calls.append(kwargs)
-        return dict(best_checkpoint=str(tmp_path / 'new.pt'), initial_validation_mse=1.,
-                    best_validation_mse=.5, best_epoch=1)
+        return training_result(args[2])
 
     monkeypatch.setattr(train, 'train_policy', capture_training)
     main.main(['--mode', 'train', '--potential-field', '--no-closed-loop-selection',
@@ -217,10 +230,10 @@ def test_main_fresh_cloud_encoder_preserves_only_requested_split_reference(tmp_p
     assert calls[0]['field_steering_loss_weight'] == .05
 
 
-def test_field_evaluation_requires_selected_model_instead_of_falling_back_to_best(tmp_path, monkeypatch):
+def test_field_evaluation_requires_latest_model_instead_of_falling_back_to_best(tmp_path, monkeypatch):
     main = importlib.import_module('main')
     policy = importlib.import_module('src.policy_tracking')
-    candidate = tmp_path / 'models' / 'tracking' / 'best.pt'
+    candidate = tmp_path / 'weights' / 'tracking' / 'best.pt'
     candidate.parent.mkdir(parents=True)
     candidate.write_bytes(b'unvalidated or withdrawn model')
 
@@ -228,7 +241,7 @@ def test_field_evaluation_requires_selected_model_instead_of_falling_back_to_bes
         pytest.fail('default field deployment must not fall back to an offline best candidate')
 
     monkeypatch.setattr(policy.NeuralPolicy, 'from_checkpoint', unexpected_load)
-    with pytest.raises(FileNotFoundError, match='selected.pt'):
+    with pytest.raises(FileNotFoundError, match='last.pt'):
         main.main(['--mode', 'evaluate', '--potential-field'] + cli_args(tmp_path, monkeypatch))
 
 
@@ -240,8 +253,7 @@ def test_main_selects_task_specific_default_cloud_encoder(tmp_path, monkeypatch,
 
     def capture(*args, **kwargs):
         calls.append(kwargs)
-        return dict(best_checkpoint=str(tmp_path / 'new.pt'), initial_validation_mse=1.,
-                    best_validation_mse=.5, best_epoch=1)
+        return training_result(args[2])
 
     monkeypatch.setattr(train, 'train_policy', capture)
     main.main(['--mode', 'train', '--potential-field', '--no-closed-loop-selection']
@@ -258,37 +270,26 @@ def test_constraint_mode_defaults_to_pure_and_requires_explicit_field_evaluation
             main.main(['--policy-safety-layer', 'forecast'] + extra + cli_args(tmp_path, monkeypatch))
 
 
-def test_main_wraps_policy_using_restored_scene_physics(tmp_path, monkeypatch):
+def test_main_inference_evaluation_uses_fresh_seeds_and_requested_physics(tmp_path, monkeypatch):
     from dataclasses import replace
-    import types
     main = importlib.import_module('main')
-    policy = importlib.import_module('src.policy_tracking')
-    rollouts = importlib.import_module('rollouts')
+    evaluation = importlib.import_module('src.evaluation')
     from config import Config
     cfg = replace(Config(), potential_enabled=True, uav_speed=55.)
     checkpoint = tmp_path / 'candidate.pt'
-    checkpoint.write_bytes(b'explicit diagnostic candidate')
-    scene = {'config_snapshot': cfg.to_dict()}
-    reference = tmp_path / 'replays' / 'tracking-expert-7101.json'
-    reference.parent.mkdir()
-    reference.write_text(json.dumps({'scene': scene, 'metadata': {'scene_id': 'same'}}), encoding='utf-8')
-    base = object()
+    torch.save(dict(task='tracking',epoch=1), checkpoint)
     calls = []
-    class Wrapper:
-        def __init__(self, base_policy, config, task):
-            assert base_policy is base
-            assert config.uav_speed == 55.
-            assert task == 'tracking'
-    monkeypatch.setattr(policy.NeuralPolicy, 'from_checkpoint', lambda *a, **kw: base)
-    monkeypatch.setitem(sys.modules, 'src.policy_constraints', types.SimpleNamespace(ForecastConstrainedPolicy=Wrapper))
-    def rollout(env, actor, **kw):
-        assert isinstance(actor, Wrapper)
-        assert env.config.uav_speed == 55.
+    def evaluate(task, config, checkpoint, destination, **kw):
+        assert task == 'tracking'
+        assert config.uav_speed == 55.
+        assert checkpoint['epoch'] == 1
         calls.append(kw)
-        return {'metadata': {'scene_id': 'same', 'control_mode': 'forecast_constraint'},
-                'summary': {}, 'frames': []}, tmp_path / 'record.json'
-    monkeypatch.setattr(rollouts, 'run_episode', rollout)
+        return dict(complete=True, requested_episodes=kw['episodes'], success_rate=.5, episodes=[])
+    monkeypatch.setattr(evaluation, 'evaluate_policy', evaluate)
     report = main.main(['--mode', 'evaluate', '--potential-field', '--policy-safety-layer', 'forecast',
-                       '--checkpoint-path', str(checkpoint)] + cli_args(tmp_path, monkeypatch))
+                       '--checkpoint-path', str(checkpoint), '--config-json', json.dumps(cfg.to_dict())]
+                      + cli_args(tmp_path, monkeypatch))
     assert len(calls) == 1
+    assert calls[0]['episodes'] == 30 and calls[0]['seed'] == 950000
+    assert calls[0]['mode'] == 'forecast'
     assert report['tasks']['tracking']['control_mode'] == 'forecast_constraint'

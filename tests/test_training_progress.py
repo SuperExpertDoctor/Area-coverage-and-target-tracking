@@ -190,11 +190,22 @@ def test_exact_resume_matches_uninterrupted_optimizer_rng_history_and_tf(tmp_pat
     assert resumed['best_epoch'] == uninterrupted['best_epoch']
     assert resumed['initial_train'] == uninterrupted['initial_train']
     assert resumed['resume_checkpoint'] == str(Path(first['last_checkpoint']).resolve())
+    assert state['resume_state']['batch_steps'] == full_state['resume_state']['batch_steps']
     events = EventAccumulator(str(tmp_path/'resume-tf')).Reload()
     assert set(events.Tags()['scalars']) == {
         f'{subset}/{metric}' for subset in ['Train', 'Validation'] for metric in ['Loss', 'Action_MSE', 'Action_MAE']}
     for tag in events.Tags()['scalars']:
         assert [item.step for item in events.Scalars(tag)] == [0, 1, 2, 3]
+    for subset in ['Train', 'Validation']:
+        relative = Path('batches')/subset.lower()
+        actual = EventAccumulator(str(tmp_path/'resume-tf'/relative)).Reload()
+        expected = EventAccumulator(str(tmp_path/'full-tf'/relative)).Reload()
+        count = state['resume_state']['batch_steps'][subset]
+        assert count > 3
+        for tag in actual.Tags()['scalars']:
+            assert [event.step for event in actual.Scalars(tag)] == list(range(1, count+1))
+            assert [(event.step, event.value) for event in actual.Scalars(tag)] == [
+                (event.step, event.value) for event in expected.Scalars(tag)]
 
 
 def test_resume_rejects_changed_data_config_and_warm_start_combination(tmp_path):
@@ -208,6 +219,9 @@ def test_resume_rejects_changed_data_config_and_warm_start_combination(tmp_path)
     with pytest.raises(ValueError, match='sequence_length'):
         train.train_policy('coverage', dataset, tmp_path/'models', tmp_path/'tf', epochs=2,
                            resume_checkpoint=checkpoint, **changed)
+    with pytest.raises(ValueError, match='validation_batch_size'):
+        train.train_policy('coverage', dataset, tmp_path/'models', tmp_path/'tf', epochs=2,
+                           resume_checkpoint=checkpoint, validation_batch_size=1, **options)
     with (dataset/'0.npz').open('ab') as stream: stream.write(b'changed bytes')
     with pytest.raises(ValueError, match='dataset'):
         train.train_policy('coverage', dataset, tmp_path/'models', tmp_path/'tf', epochs=2,
@@ -309,3 +323,197 @@ def test_preparation_failure_publishes_failed_status(tmp_path):
     status = json.loads((output/'training-status.json').read_text())
     assert status['state'] == 'failed'
     assert 'no valid' in status['error']
+
+
+@pytest.mark.parametrize('training', [False, True])
+def test_completed_batch_callback_reports_local_metrics_without_padding(training):
+    class Fixed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.action = torch.nn.Parameter(torch.tensor([1., 2.]))
+        def forward(self, observations, hidden=None):
+            batch, steps = observations['vector'].shape[:2]
+            return self.action.expand(batch, steps, 2), torch.zeros(1, batch, 1)
+    model = Fixed()
+    data = [dict(vector=torch.zeros(length, 134), actions=torch.full((length, 2), float(index)))
+            for index, length in enumerate([5, 2, 3])]
+    optimizer = torch.optim.Adam(model.parameters(), lr=0) if training else None
+    batches = []
+    def completed(metrics):
+        if training:
+            assert int(optimizer.state[model.action]['step']) == len(batches) + 1
+        else:
+            assert model.action.grad is None
+        batches.append(metrics)
+    metrics = train._run_epoch(model, data, 2, 2, torch.device('cpu'), optimizer=optimizer,
+                               batch_callback=completed)
+    assert [batch['steps'] for batch in batches] == [4, 2, 1, 2, 1]
+    assert [batch['sequences'] for batch in batches] == [2, 1, 1, 1, 1]
+    assert [batch['loss'] for batch in batches] == pytest.approx([3., 5., 5., 1., 1.])
+    assert [batch['action_mse'] for batch in batches] == pytest.approx([1.5, 2.5, 2.5, .5, .5])
+    assert [batch['action_mae'] for batch in batches] == pytest.approx([1., 1.5, 1.5, .5, .5])
+    assert metrics['steps'] == 10
+    for key in ['loss', 'action_mse', 'action_mae']:
+        assert metrics[key] == pytest.approx(sum(batch[key] * batch['steps'] for batch in batches) / 10)
+
+
+def expected_batch_samples(paths, batch_size, sequence_length, order=None):
+    lengths = []
+    for path in paths:
+        with np.load(path, allow_pickle=False) as arrays:
+            lengths.append(len(arrays['actions']))
+    if order is not None:
+        lengths = [lengths[index] for index in order]
+    return [sum(max(0, min(sequence_length, length - start)) for length in lengths[offset:offset+batch_size])
+            for offset in range(0, len(lengths), batch_size)
+            for start in range(0, max(lengths[offset:offset+batch_size]), sequence_length)]
+
+
+def test_batch_tensorboard_flushes_each_batch_with_independent_validation_size(tmp_path, monkeypatch):
+    dataset = tmp_path/'data'; dataset.mkdir()
+    for index in range(8):
+        field_episode(dataset/f'{index}.npz', f'scene-{index}', length=index+1)
+    flushed = []
+    phase_batch_sizes = []
+    run_epoch = train._run_epoch
+    def observe_batch_size(*args, **kwargs):
+        phase_batch_sizes.append(args[2])
+        return run_epoch(*args, **kwargs)
+    monkeypatch.setattr(train, '_run_epoch', observe_batch_size)
+    writer_type = train.SummaryWriter
+    class ObservedWriter(writer_type):
+        def __init__(self, *args, **kwargs):
+            self.pending_batch_tags = []
+            super().__init__(*args, **kwargs)
+        def add_scalar(self, tag, *args, **kwargs):
+            super().add_scalar(tag, *args, **kwargs)
+            if tag.startswith('Batch/'):
+                self.pending_batch_tags.append(tag)
+        def flush(self):
+            super().flush()
+            if self.pending_batch_tags:
+                assert len(self.pending_batch_tags) == 4
+                events = EventAccumulator(self.log_dir).Reload()
+                assert set(events.Tags()['scalars']) == set(self.pending_batch_tags)
+                flushed.append((Path(self.log_dir).name,
+                                {tag: events.Scalars(tag)[-1].step for tag in self.pending_batch_tags}))
+                self.pending_batch_tags.clear()
+    monkeypatch.setattr(train, 'SummaryWriter', ObservedWriter)
+    result = train.train_policy('coverage', dataset, tmp_path/'weights', tmp_path/'tf', epochs=1,
+                                batch_size=3, validation_batch_size=2, sequence_length=2,
+                                validation_fraction=.5, seed=17,
+                                model_config=dict(potential_field=True, hidden_size=8))
+    expected = {
+        'Train': expected_batch_samples(result['split']['train_paths'], 3, 2,
+                                        np.random.default_rng(17).permutation(4)),
+        'Validation': expected_batch_samples(result['split']['validation_paths'], 2, 2)}
+    for subset, samples in expected.items():
+        events = EventAccumulator(str(tmp_path/'tf'/'batches'/subset.lower())).Reload()
+        assert set(events.Tags()['scalars']) == {f'Batch/{subset}/{metric}'
+                                                 for metric in ['Loss', 'Action_MSE', 'Action_MAE', 'Samples']}
+        for tag in events.Tags()['scalars']:
+            assert [event.step for event in events.Scalars(tag)] == list(range(1, len(samples)+1))
+        assert [event.value for event in events.Scalars(f'Batch/{subset}/Samples')] == samples
+        for tag, key in [('Loss', 'loss'), ('Action_MSE', 'action_mse'), ('Action_MAE', 'action_mae')]:
+            weighted = sum(event.value * count for event, count in
+                           zip(events.Scalars(f'Batch/{subset}/{tag}'), samples)) / sum(samples)
+            assert weighted == pytest.approx(result['history'][0][subset][key], rel=1e-6)
+        subset_flushes = [steps for name, steps in flushed if name == subset.lower()]
+        assert len(subset_flushes) == len(samples)
+        assert [set(steps.values()) for steps in subset_flushes] == [{i} for i in range(1, len(samples)+1)]
+    assert result['train_config']['validation_batch_size'] == 2
+    assert phase_batch_sizes == [2, 3, 3, 2]
+
+
+def test_training_log_directory_separates_json_from_weights_and_records_failures(tmp_path):
+    dataset, options = setup_run(tmp_path)
+    output, logs = tmp_path/'weights', tmp_path/'logs'
+    result = train.train_policy('coverage', dataset, output, tmp_path/'tf', epochs=1, log_dir=logs, **options)
+    assert {path.suffix for path in output.rglob('*') if path.is_file()} == {'.pt'}
+    for filename in ['history.json', 'training_history.json', 'dataset_split.json', 'train_manifest.json',
+                     'val_manifest.json', 'training-status.json', 'train_config.json', 'model_config.json']:
+        assert (logs/filename).is_file()
+    assert json.loads((logs/'history.json').read_text()) == result
+    assert json.loads((logs/'train_config.json').read_text()) == result['train_config']
+    with pytest.raises(ValueError, match='sequence_length'):
+        train.train_policy('coverage', dataset, output, tmp_path/'tf', epochs=2, log_dir=logs,
+                           resume_checkpoint=result['last_checkpoint'], **dict(options, sequence_length=3))
+    assert json.loads((logs/'training-status.json').read_text())['state'] == 'failed'
+    assert not (output/'training-status.json').exists()
+
+
+@pytest.mark.parametrize('validation_batch_size', [0, -1, True, 1.5])
+def test_invalid_validation_batch_size_fails_before_dataset_loading(tmp_path, validation_batch_size):
+    with pytest.raises(ValueError, match='validation_batch_size'):
+        train.train_policy('coverage', tmp_path/'absent', tmp_path/'weights', tmp_path/'tf',
+                           epochs=1, validation_batch_size=validation_batch_size)
+
+
+def test_resume_purges_interrupted_batch_events_without_erasing_completed_batches(tmp_path):
+    dataset, options = setup_run(tmp_path)
+    first = train.train_policy('coverage', dataset, tmp_path/'weights', tmp_path/'tf', epochs=1, **options)
+    saved = torch.load(first['last_checkpoint'], weights_only=False)
+    original = {}
+    for subset in ['Train', 'Validation']:
+        directory = tmp_path/'tf'/'batches'/subset.lower()
+        before = EventAccumulator(str(directory)).Reload()
+        original[subset] = {tag: [(event.step, event.value) for event in before.Scalars(tag)]
+                            for tag in before.Tags()['scalars']}
+        # Events after the saved epoch can have reached disk before a crash.
+        with train.SummaryWriter(log_dir=str(directory)) as writer:
+            for step in [saved['resume_state']['batch_steps'][subset] + 1, 1000]:
+                for metric in ['Loss', 'Action_MSE', 'Action_MAE', 'Samples']:
+                    writer.add_scalar(f'Batch/{subset}/{metric}', -999, step)
+    train.train_policy('coverage', dataset, tmp_path/'weights', tmp_path/'tf', epochs=2,
+                       resume_checkpoint=first['last_checkpoint'], **options)
+    final = torch.load(first['last_checkpoint'], weights_only=False)
+    for subset in ['Train', 'Validation']:
+        events = EventAccumulator(str(tmp_path/'tf'/'batches'/subset.lower())).Reload()
+        count = final['resume_state']['batch_steps'][subset]
+        for tag in events.Tags()['scalars']:
+            actual = [(event.step, event.value) for event in events.Scalars(tag)]
+            assert [step for step, _ in actual] == list(range(1, count+1))
+            assert actual[:len(original[subset][tag])] == original[subset][tag]
+            assert all(value != -999 for _, value in actual)
+
+
+def test_legacy_exact_resume_defaults_validation_size_and_starts_batch_counters(tmp_path):
+    dataset, options = setup_run(tmp_path)
+    result = train.train_policy('coverage', dataset, tmp_path/'weights', tmp_path/'old-tf', epochs=1, **options)
+    checkpoint = torch.load(result['last_checkpoint'], weights_only=False)
+    del checkpoint['train_config']['validation_batch_size']
+    del checkpoint['resume_state']['batch_steps']
+    legacy_path = tmp_path/'legacy-last.pt'
+    torch.save(checkpoint, legacy_path)
+    resumed = train.train_policy('coverage', dataset, tmp_path/'resumed', tmp_path/'new-tf', epochs=2,
+                                 resume_checkpoint=legacy_path, **options)
+    state = torch.load(resumed['last_checkpoint'], weights_only=False)
+    assert state['train_config']['validation_batch_size'] == options['batch_size']
+    assert all(count > 0 for count in state['resume_state']['batch_steps'].values())
+    for subset in ['Train', 'Validation']:
+        events = EventAccumulator(str(tmp_path/'new-tf'/'batches'/subset.lower())).Reload()
+        assert events.Scalars(f'Batch/{subset}/Samples')[0].step == 1
+
+
+def test_same_second_resume_keeps_tensorboard_event_files_in_creation_order(tmp_path, monkeypatch):
+    from tensorboard.summary.writer import event_file_writer
+    dataset, options = setup_run(tmp_path)
+    clock = [1000.25]
+    pauses = []
+    def advance(seconds):
+        pauses.append(seconds)
+        clock[0] += seconds
+    monkeypatch.setattr(train.time, 'time', lambda: clock[0])
+    monkeypatch.setattr(train.time, 'sleep', advance)
+    # Train's batch writer crosses UID 9 -> 10 between the two sessions. The
+    # TensorBoard reader sorts these unpadded filename suffixes lexically.
+    monkeypatch.setattr(event_file_writer, '_global_uid', event_file_writer.AtomicCounter(6))
+    result = train.train_policy('coverage', dataset, tmp_path/'weights', tmp_path/'tf', epochs=1, **options)
+    train.train_policy('coverage', dataset, tmp_path/'weights', tmp_path/'tf', epochs=2,
+                       resume_checkpoint=result['last_checkpoint'], **options)
+    state = torch.load(result['last_checkpoint'], weights_only=False)
+    for subset in ['Train', 'Validation']:
+        events = EventAccumulator(str(tmp_path/'tf'/'batches'/subset.lower())).Reload()
+        assert [event.step for event in events.Scalars(f'Batch/{subset}/Samples')] == list(
+            range(1, state['resume_state']['batch_steps'][subset]+1))
+    assert len(pauses) == 1 and 0 < pauses[0] <= 1

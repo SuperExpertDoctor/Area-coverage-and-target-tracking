@@ -31,8 +31,8 @@
               <select id="actor" class="compact-select"><option value="expert">专家策略</option><option value="policy">行为克隆网络</option></select>
               <label class="control-label" for="replay-select">回放记录</label>
               <select id="replay-select" class="replay-select"><option value="">正在读取回放记录…</option></select>
-              <div class="menu-actions"><button id="refresh" class="text-button"><svg viewBox="0 0 20 20"><path d="M16 6V2m0 4h-4M16 6a7 7 0 1 0 1 7"/></svg>刷新列表</button><label class="upload-button" for="replay-file"><svg viewBox="0 0 20 20"><path d="M10 13V3m-4 4 4-4 4 4M3 13v4h14v-4"/></svg>导入 JSON</label></div>
-              <input id="replay-file" type="file" accept=".json,application/json" hidden>
+              <div class="menu-actions"><button id="refresh" class="text-button"><svg viewBox="0 0 20 20"><path d="M16 6V2m0 4h-4M16 6a7 7 0 1 0 1 7"/></svg>刷新列表</button><label class="upload-button" for="replay-file"><svg viewBox="0 0 20 20"><path d="M10 13V3m-4 4 4-4 4 4M3 13v4h14v-4"/></svg>导入 NPZ / JSON</label></div>
+              <input id="replay-file" type="file" accept=".npz,.json,application/json,application/octet-stream" hidden>
             </div>
           </details>
           <details class="menu" id="view-menu">

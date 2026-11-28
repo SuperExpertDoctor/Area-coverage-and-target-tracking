@@ -15,7 +15,6 @@ RUN_NAME="formal-1000"
 # Optional explicit inputs. Empty strings use the task's standard output paths.
 CHECKPOINT_PATH=""
 SPLIT_REFERENCE_CHECKPOINT=""
-RESUME_CHECKPOINT=""
 DATASET_MANIFEST=""
 export PYTHONIOENCODING=utf-8
 export PYTHONUNBUFFERED=1
@@ -204,7 +203,6 @@ JSON
 INPUT_ARGS=()
 if [[ -n "$CHECKPOINT_PATH" ]]; then INPUT_ARGS+=(--checkpoint-path "$CHECKPOINT_PATH"); fi
 if [[ -n "$SPLIT_REFERENCE_CHECKPOINT" ]]; then INPUT_ARGS+=(--split-reference-checkpoint "$SPLIT_REFERENCE_CHECKPOINT"); fi
-if [[ -n "$RESUME_CHECKPOINT" ]]; then INPUT_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT"); fi
 if [[ -n "$DATASET_MANIFEST" ]]; then INPUT_ARGS+=(--dataset-manifest "$DATASET_MANIFEST"); fi
 # Avoid bytecode writes before main.py validates and scopes runtime cache paths.
 exec "$PYTHON" -B main.py \
@@ -216,9 +214,9 @@ exec "$PYTHON" -B main.py \
   --render-every 5 --realtime-factor 0 --progress-every 300 \
   --expert-seed 7100 --collection-seed 12000 \
   --episodes 1000 --collection-attempt-multiplier 3 \
-  --collection-workers 8 --collection-replay-every 60 --collection-resume --collection-require-task-success \
+  --collection-workers 8 --collection-replay-every 60 --collection-require-task-success \
   --collection-coverage-seconds 10800 --collection-tracking-seconds 1800 \
-  --epochs 20 --batch-size 16 --sequence-length 128 \
+  --epochs 20 --batch-size 4 --validation-batch-size 4 --sequence-length 64 \
   --learning-rate 0.0003 --weight-decay 0.00001 --grad-clip 1 \
   --validation-fraction 0.2 --training-seed 42 \
   --training-progress-every 50 --training-progress-seconds 30 --training-load-workers 4 \
@@ -227,8 +225,8 @@ exec "$PYTHON" -B main.py \
   --policy-safety-layer none --no-warm-start --no-coverage-ego-map --coverage-ego-map-sigma 2 --coverage-ego-map-mode gaussian \
   --no-coverage-mask-previous-command \
   --device auto --inference-device cpu --num-threads 4 --inference-num-threads 1 \
-  --formal-test-episodes 8 --formal-test-seed 960000 --formal-test-workers 4 --formal-test-replay-every 60 \
-  --formal-coverage-safety-layer forecast --formal-monitor-seconds 30 --formal-resume \
+  --eval-episodes 30 --eval-seed 960000 --eval-workers 4 --eval-replay-every 60 \
+  --formal-coverage-safety-layer forecast --formal-monitor-seconds 30 \
   --browser-recording --recording-headless --recording-fps 24 --recording-width 1440 --recording-height 900 \
   --recording-duration-seconds 30 --recording-bitrate 8000000 --recording-max-bytes 268435456 --recording-max-seconds 600 \
   --dagger-episodes 4 --dagger-iteration 1 --dagger-beta 0.8 --dagger-seed 24000 --dagger-initial-pan-jitter 0 --dagger-max-steps 0 --no-dagger-collect-only \
@@ -236,7 +234,7 @@ exec "$PYTHON" -B main.py \
   --validation-boundary-seeds 4000 4001 4002 --validation-boundary-starts 8 \
   --validation-tracking-seeds 5000 5001 5002 5003 5004 5005 5006 5007 5008 5009 \
   --validation-workers 4 --validation-coverage-seconds 10800 --validation-tracking-seconds 1800 \
-  --validation-trajectory-every 60 --validation-coverage-ratio 1 --validation-resume \
+  --validation-trajectory-every 60 --validation-coverage-ratio 1 \
   --save-video --video-fps 24 --video-max-frames 480 \
   --video-width 1440 --video-height 900 \
   "${INPUT_ARGS[@]}" \
