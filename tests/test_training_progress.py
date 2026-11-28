@@ -433,12 +433,12 @@ def test_training_log_directory_separates_json_from_weights_and_records_failures
     for filename in ['history.json', 'training_history.json', 'dataset_split.json', 'train_manifest.json',
                      'val_manifest.json', 'training-status.json', 'train_config.json', 'model_config.json']:
         assert (logs/filename).is_file()
-    assert json.loads((logs/'history.json').read_text()) == result
-    assert json.loads((logs/'train_config.json').read_text()) == result['train_config']
+    assert json.loads((logs/'history.json').read_text(encoding='utf-8')) == result
+    assert json.loads((logs/'train_config.json').read_text(encoding='utf-8')) == result['train_config']
     with pytest.raises(ValueError, match='sequence_length'):
         train.train_policy('coverage', dataset, output, tmp_path/'tf', epochs=2, log_dir=logs,
                            resume_checkpoint=result['last_checkpoint'], **dict(options, sequence_length=3))
-    assert json.loads((logs/'training-status.json').read_text())['state'] == 'failed'
+    assert json.loads((logs/'training-status.json').read_text(encoding='utf-8'))['state'] == 'failed'
     assert not (output/'training-status.json').exists()
 
 
